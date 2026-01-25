@@ -1,0 +1,22 @@
+networkx
+numpy
+matplotlib
+shapely
+pandas
+scipy
+pygame
+
+torch>=2.0
+torch_geometric
+
+# My Installation Steps: (all inside git folder)
+# Create a new environment (needed for low python level)
+#     python3 -m venv .junctionvenv
+#     source .junctionvenv/bin/activate
+
+# Upgrade pip (optional again)
+#     pip install --upgrade pip
+
+# Install requirements
+#     pip install torch torchvision
+#     pip install -r requirements.txt
