@@ -1,3 +1,5 @@
+#NOTE: Entirely AI generated test case
+
 import pygame
 import numpy as np
 import random
@@ -41,7 +43,7 @@ def run_simulation():
                         r_node = random.choice(["inqN1", "inqN2", "inqS1", "inqS2", "inqW", "inqE"])
                         r_dir = random.choice(list(Direction))
                         
-                        v_new = Vehicle(r_node, r_dir, graph, start_speed=8 + random.random()*4) #This will automatically error if invalid route
+                        v_new = Vehicle(r_node, r_dir, graph, start_speed=6 + random.random()*4) #This will automatically error if invalid route. Start speed is variable
                         vehicles.append(v_new)
                         spawned = True
                         print(f"Spawned: {r_node} going {r_dir.name}")
@@ -72,18 +74,16 @@ def run_simulation():
 
         # 2. Draw Vehicles (Dynamic)
         for v in vehicles:
-            x, y, angle = v.get_global_position()
+            box = v.get_bounding_box()
             
-            # Simple rectangle representation
-            # Note: Pygame rotation is degrees, counter-clockwise
-            # Math angle is radians. 
+            # Convert world coordinates (meters) to screen coordinates (pixels)
+            screen_points = []
+            for x, y in box.exterior.coords:
+                screen_points.append(world_to_screen(x, y))
             
-            # Draw center point
-            cx, cy = world_to_screen(x, y)
-            pygame.draw.circle(screen, (0, 255, 0), (cx, cy), 5)
-            
-            # (Optional) Draw full rotated rect would require more math, 
-            # for debugging, a circle is fine.
+            # Draw the filled car body (Green)
+            pygame.draw.polygon(screen, (0, 255, 0), screen_points)
+        
 
         pygame.display.flip()
         pygame.display.set_caption(f"Traffic Sim | Cars: {len(vehicles)}")

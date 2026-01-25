@@ -18,14 +18,12 @@ class IntersectionGraph:
         self.G = nx.DiGraph()
 
         QUEUE_LENGTH = 15 #Decides the length of the queue adjacent to both the incoming and outgoing nodes of the intersection
-
-        INTERSECTION_WIDTH = 12.5 #Horizontal half-size of the intersection
-        INTERSECTION_HEIGHT = 9 #Vertical half-size of the intersection
+        INTERSECTION_WIDTH = 16 #Horizontal half-size of the intersection
+        INTERSECTION_HEIGHT = 12.5 #Vertical half-size of the intersection. For an intersection such as this one, aim for LANE WIDTH + HALF HEIGHT to equal HALF WIDTH for circular left turns
         LANE_WIDTH = 3.5 #Diameter of each Lane. Cars will not completely fill up each lane, being approximately 60% of the size
+        LANE_GAP = 1 #Represents the median in the middle, or the gap, between incoming and outgoing lanes on the same road. Two incoming lanes are assumed to have no gap.
 
-        LANE_GAP = 0.5 #Represents the median in the middle, or the gap, between incoming and outgoing lanes on the same road. Two incoming lanes are assumed to have no gap.
-
-        self.curve_points = 10
+        self.curve_points = 25
 
         #Centre is 0,0
         self.in_nodes = { #In Nodes represent nodes in which existing cars will use to ENTER the intersection
