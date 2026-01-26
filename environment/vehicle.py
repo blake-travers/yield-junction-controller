@@ -3,6 +3,7 @@ import uuid
 from enum import Enum
 from intersection_network import Direction
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 
 class VehicleAction(Enum):
@@ -10,7 +11,7 @@ class VehicleAction(Enum):
     ACCEL = 1
 
 class Vehicle:
-    def __init__(self, spawn_node, direction:Direction, graph, length = 5.5, width = 2.5, max_speed = 14, accel = 3, brake = 5, start_speed = 0):
+    def __init__(self, spawn_node, direction:Direction, graph, length = 5.5, width = 2.5, max_speed = 15, accel = 6, brake = 10, start_speed = 0):
         self.id = str(uuid.uuid4())[:8]
 
         self.length = length
@@ -22,6 +23,7 @@ class Vehicle:
         self.position = 0 #Distance travelled along the current edge of the route
         self.speed = start_speed
         self.done = False
+        self.direction = direction
 
         self.graph = graph #Represents the state of the graph... used to determine route etc
         self.route = self._calculate_route(spawn_node, direction)
@@ -148,19 +150,12 @@ class Vehicle:
             
         return Polygon(corners_global)
 
-    def _get_projected_location(self, action, time):
+
+    def _calculate_projected_distance(self, action, time):
         """
-        Determines the projected location of this Vehicle after a certain period of time given a specific action
+        Helper function representing the projected distance given an time value and assuming a constant action throughout this time
+        
         """
-
-        if action == VehicleAction.ACCEL:
-            value = self.accel
-        else:
-            value = -self.brake
-
-        future_speed = self.speed + value * time
-        future_speed = np.clip(future_speed, 0, self.max_speed)
-
         if action == VehicleAction.ACCEL:
             accel = self.accel
             target_speed = self.max_speed
@@ -176,8 +171,14 @@ class Vehicle:
             dist_to_limit = (target_speed**2 - self.speed**2) / (2 * accel) #Distance travelled below the limit
             time_at_limit = time - time_to_limit #Time travelled at the limit
             dist_at_limit = target_speed * time_at_limit #Distance travelled at the limit. At brake this is always zero because target speed is 0
-            
             distance_travelled = dist_to_limit + dist_at_limit #Total distance travelled
+
+        return distance_travelled
+    
+    def _get_box_at_distance(self, distance_travelled):
+        """
+        Helper function representing the bounding box at a specific distance from this car
+        """
 
         remaining_dist = self.position + distance_travelled #This represents the total distance from the start of the node.
 
@@ -205,6 +206,15 @@ class Vehicle:
         future_angle = np.arctan2(next_pt.y - pt.y, next_pt.x - pt.x) #Calculate angle at this point for bounding box
 
         return self.get_bounding_box(x=pt.x, y=pt.y, angle=future_angle) #Return the bounding box representing the location in which the car will be
+    
+
+    def _get_projected_location(self, action, time):
+        """
+        Determines the projected location of this Vehicle after a certain period of time given a specific action
+        """
+
+        distance_travelled = self._calculate_projected_distance(action, time) #Calculate the projected distance
+        return self._get_box_at_distance(distance_travelled) #Get the corresponding bounding box for this distance
 
 
     def get_possible_locations(self, dt):
@@ -212,27 +222,85 @@ class Vehicle:
         Gets a representation of all the possible locations this Vehicle can be located, after a certain period of time and assuming maximum acceleration and braking constraints (no crashes)
 
         Uses _get_projected_location for both maximum acceleration and minimum acceleration, to determine a "snake-like" structure representing every possible location of the other car.
+
+        Start of the snake: Location if this car slams its brakes on
+        End of the snake: Location if this car floors the accelerator
         """
 
-    def check_collision(self, other, own_locations):
+        current_d = self._calculate_projected_distance(VehicleAction.BRAKE, dt) #Start at brake distance
+        dist_accel = self._calculate_projected_distance(VehicleAction.ACCEL, dt) #Eventually move up to accelerate distance
+
+        boxes = []
+
+        while current_d <= dist_accel: 
+            box = self._get_box_at_distance(current_d) #Get the box at this distance
+            boxes.append(box)
+            
+            current_d += self.length - 1 # Step size relative to car length
+
+        if current_d < dist_accel + 4.0: #Ensure to capture last, max accel box to finish the snake
+            boxes.append(self._get_box_at_distance(dist_accel))
+
+        if boxes:
+            return unary_union(boxes)
+        else:
+            return self.get_bounding_box() #Return this very box if nothing in boxes
+        
+    def _must_yield(self, other):
         """
-        Will this car's projected location (based upon a specific action) intersect with another car's possible locations (action agnostic)
+        Returns True if 'self' must yield to 'other' based on traffic rules.
+        """
+
+        if self.current_start_node == other.current_start_node: #If on the same node
+            if self.position > other.position: #If in front of them
+                return False
+            return True #If behind them
+        
+        if other.current_end_node == self.current_start_node: #Immediately return false if their end node is my start node
+            return False
+        
+        if other.current_start_node == self.current_end_node: #Immediately return True if their start node is my end node
+            return True
+
+        if self.direction != Direction.STRAIGHT and other.direction == Direction.STRAIGHT: #If I am turning and the other guy is going straight, must yield
+            return True
+        
+        if self.direction == Direction.LEFT and other.direction == Direction.RIGHT: #TODO This is adequate for now, if going LEFT and other is going RIGHT i must yield
+            return True
+            
+        return False
+
+    def action_decision(self, all_vehicles):
+        """
+        Will this car's projected location (based upon a specific action) intersect with another car's possible locations (action agnostic)? If so, then we brake. If not, then we accelerate
 
         Check the result for a multitude of timesteps, when the car is crossing the path.
         
         However, intersection bounding is a rather computationally expensive process (50 microseconds per, meaning 50 * 400 (20 car average) = 20ms or 50 fps which is atrocious for RL)
 
         For now, just do intersection bounding as we first want to get the simulation up and running, but if neccesary, generate a fixed number of large squares,
-        a rough representation of the car bounding box / the snake possible locations, and use those to filter out 80% of cars that are not a problem in the slightest in a more computationally inexpensive manner.
-        
+        a rough representation of the car bounding box, and check that inexpensively first. (AABB check)
+
+        This implementation does not consider situations in which the car would accelreate, then brake, then accelerate and make it through the intersection that way. Since this is a small intersection.
+        and calculating stuff like that is computationally expensive O(n^2), we keep to just accelerate checks for now. If ANY ONE of them fails, we stay braked.
         """
 
-    def action_decision(self):
-        """
-        For each existing car, check to see if this car is going to collide if it accelerates at this timestep
+        t = 0.25
+        while t < (self.max_speed / self.brake): #As long as the car can still brake in time
+            my_future_box = self._get_projected_location(VehicleAction.ACCEL, t) #Calculate the acceleration box at this timestep
 
-        If so, then we brake. If not, then we accelerate
-        """
+            for other in all_vehicles: #For every car (need to bounding box AABB to speed up TODO)
+                if other.id == self.id: continue #If self dont care
+                if other.done: continue #if done dont care
+                if self._must_yield(other): #if i dont need to yield
+                    other_future_box = other.get_possible_locations(t) #Get the projected location of this other car's possible actions box at this timestep
+                else:
+                    continue
 
+                if my_future_box.intersects(other_future_box):  #If these two boxes intersect, immediately must brake.
+                    return VehicleAction.BRAKE
+            t += 0.25
+
+        return VehicleAction.ACCEL #If none of these intersects, we can confirm the opportunity to go.
 
 
