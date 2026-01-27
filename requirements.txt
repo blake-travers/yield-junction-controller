@@ -6,6 +6,10 @@ pandas
 scipy
 pygame
 
+eclipse-sumo
+traci
+sumolib
+
 torch>=2.0
 torch_geometric
 
