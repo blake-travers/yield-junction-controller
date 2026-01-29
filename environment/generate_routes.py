@@ -22,9 +22,9 @@ def generate_routes():
 
     # 4. Run the command using absolute paths
     # We wrap paths in quotes "" to handle any potential spaces in folder names
-    cmd = f'python "{random_trips_path}" -n "{net_file}" -r "{route_file}" -e 3600 -p 2'
+    cmd = f'python "{random_trips_path}" -n "{net_file}" -r "{route_file}" -e 3600 -p 2 --trip-attributes "departLane=\'best\'"'
 
-    print(f"Generating routes in: {base_path}")
+    print(f"Generating routes in: {route_file}")
     os.system(cmd)
     
     # 5. Verify it worked

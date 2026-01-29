@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+FEATURES = 3
+
 class TrafficGNN(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         """
@@ -23,7 +25,8 @@ class TrafficGNN(nn.Module):
         #Second Phase: Flow and Conflict Convolutional layers that allow lanes to talk to each other smartly
         self.flow_conv = nn.Linear(hidden_dim, hidden_dim)
         self.conflict_conv = nn.Linear(hidden_dim, hidden_dim)
-        self.update_gate = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.update_gate = nn.Linear(hidden_dim * FEATURES, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim * FEATURES)
 
         #Third Phase: Outputs a single Priority value per lane
         self.lane_scoring = nn.Sequential(
@@ -47,13 +50,15 @@ class TrafficGNN(nn.Module):
         lane_embeddings = lane_embeddings.view(batch_size, num_lanes, -1) #Reshape back ready to graph convolution
         
         m_flow = torch.matmul(adj_flow, lane_embeddings) # Matrix multiply by both flow and conflict matrix to get each individually
-        m_conf = torch.matmul(adj_conf, lane_embeddings)
+        m_conflict = torch.matmul(adj_conf, lane_embeddings)
         
         m_flow = F.relu(self.flow_conv(m_flow)) #Activation function & through weights
-        m_conf = F.relu(self.conf_conv(m_conf))
+        m_conflict = F.relu(self.conflict_conv(m_conflict))
         
-        combined = torch.cat([lane_embeddings, m_flow, m_conf], dim=2) #Combine the lane embeddings and the matrix multiplication results
-        context_embeddings = F.relu(self.update_gate(combined)) #Activation function this
+        context_embeddings = torch.cat([lane_embeddings, m_flow, m_conflict], dim=2) #Combine the lane embeddings and the matrix multiplication results
+        context_embeddings = self.ln1(context_embeddings)
+        context_embeddings = F.relu(self.update_gate(context_embeddings)) #Activation function this
+        
         
         lane_q_values = self.lane_scoring(context_embeddings) #Grab the final Q values
         

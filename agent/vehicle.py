@@ -19,6 +19,8 @@ class Vehicle:
         self.waittime = 0.0
         self.max_speed = 15 #traci.vehicle.getMaxSpeed(self.id)
 
+        traci.vehicle.setLaneChangeMode(self.id, 0) #Disable all lane changing for this vehicle
+
         self.direction = self._getStaticDirection()
         self.lane_index = -1 #Represents a value between -1 and 1 (where 0 is the intersection) on how far through the route we are
         self.lane_id = "" #Lane ID used to calculate length
@@ -85,3 +87,9 @@ class Vehicle:
 
     def getLaneID(self):
         return self.lane_id
+    
+    def getPosition(self):
+        return self.position #TODO this could be changed to give more informative information to the agent in future
+    
+    def getDirection(self):
+        return self.direction

@@ -6,7 +6,7 @@ import torch.optim as optim
 
 from agent.modelGNN import TrafficGNN
 
-class PrioritizedReplayBuffer:
+class PrioritisedReplayBuffer:
     """
     PER works by calculating the most important replays to train on first. Edge cases will therefore be better represented and dealt with in the model
     """
@@ -16,6 +16,19 @@ class PrioritizedReplayBuffer:
         self.buffer = []
         self.priorities = np.zeros((capacity,), dtype=np.float32) #List of priorities capacity long
         self.pos = 0 #We use position instead of queue becuase it is lower complexity O(1) instead of O(n)
+
+    def push(self, state, action, reward, next_state, done): #Push this new memory 
+        max_prio = self.priorities.max() if self.buffer else 1.0 #Ensure new memories are important
+        
+        experience = (state, action, reward, next_state, done)
+        
+        if len(self.buffer) < self.capacity: #If there is space, add
+            self.buffer.append(experience)
+        else: #If not, replace this memory with oldest
+            self.buffer[self.pos] = experience
+        
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity #Update new position
 
     def sample(self, batch_size, beta=0.4):
         """
@@ -58,6 +71,7 @@ class DoubleDQNAgent:
         self.num_lanes = num_lanes
         self.num_phases = num_phases
         self.phase_mask = phase_mask.to(device)
+        #self.test = 0
         
         self.adj_flow = adj_flow.to(device)
         self.adj_conf = adj_conf.to(device)
@@ -69,10 +83,10 @@ class DoubleDQNAgent:
         self.target_net.eval()
         
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
-        self.loss_fn = nn.MSELoss(reduction='none')
+        self.loss_fn = nn.SmoothL1Loss()
 
     def _get_phase_q_values(self, lane_q_values): #Sum up the lane q values to get the highest phase
-        phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t())
+        phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t()) / self.num_lanes
         return phase_q_values
 
     def select_action(self, state, epsilon):
@@ -90,22 +104,24 @@ class DoubleDQNAgent:
 
     def train_step(self, buffer, batch_size, gamma, beta):
 
-        batch, indices, weights = buffer.sample(batch_size, beta) #Sample a PER batch
-        if batch is None: return 0.0 #Happens if we don't have any experiences yet
+        batch, indices, weights = buffer.sample(batch_size, beta)
+        if batch is None: return 0.0
         
         states, actions, rewards, next_states, dones = batch
         
-        #Prepare all the information from this batch for training
-        states = torch.stack(states).to(self.device)
+        #Fix & Convert shapes into a useable format for torch
+        states = torch.cat(states).to(self.device)
+        next_states = torch.cat(next_states).to(self.device)
         actions = torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1)
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(1)
-        next_states = torch.stack(next_states).to(self.device)
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device).unsqueeze(1)
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device).unsqueeze(1)
+
 
         current_lane_q = self.policy_net(states, self.adj_flow, self.adj_conf)
         current_phase_q_all = self._get_phase_q_values(current_lane_q) #Get the all the Q phase values represented by the policy net
         current_q = current_phase_q_all.gather(1, actions)
+        q_mean = current_q.mean().item()
 
         with torch.no_grad():
             next_lane_q_policy = self.policy_net(next_states, self.adj_flow, self.adj_conf)
@@ -119,17 +135,41 @@ class DoubleDQNAgent:
             target_q = rewards + (gamma * next_q_value * (1 - dones)) #Compare the two and the rewards
 
         td_error = torch.abs(current_q - target_q) #Calculate Temporal Difference error - heart of DQN
+        td_error_mean = td_error.mean().item()
         loss = (self.loss_fn(current_q, target_q) * weights).mean()
 
         self.optimizer.zero_grad() #Determine loss and Backpropagate
         loss.backward()
+        """
+        self.test += 1
+        if self.test % 100 == 0:
+            print("--- GRADIENT & WEIGHT DIAGNOSTICS ---")
+            # Check the "Gate" that combines lane info
+            gate_grad = self.policy_net.update_gate.weight.grad.abs().mean().item()
+            gate_weight = self.policy_net.update_gate.weight.abs().mean().item()
+            
+            # Check the Final Output Layer
+            out_grad = self.policy_net.lane_scoring[0].weight.grad.abs().mean().item()
+            out_weight = self.policy_net.lane_scoring[0].weight.abs().mean().item()
+            
+            print(f"Gate Weight: {gate_weight:.4f} | Gate Grad: {gate_grad:.4f}")
+            print(f"Output Weight: {out_weight:.4f} | Output Grad: {out_grad:.4f}")
+            print(f"Max Target Q: {target_q.max().item():.2f}")
+        """
+
+
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0) #Clip like in PPO
         self.optimizer.step()
 
         new_priors = td_error.detach().cpu().numpy().flatten() + 1e-6
         buffer.update_priorities(indices, new_priors)
 
-        return loss.item()
+        return {
+            "loss": loss.item(),
+            "td_error": td_error_mean,
+            "q_mean": q_mean
+        }
 
-    def update_target_network(self): #Iterativelyt updates the target network when appropriate. Target network aims to prevent training instability
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+    def update_target_network(self, tau=0.005):
+        for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()): #Soft update target
+            target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)

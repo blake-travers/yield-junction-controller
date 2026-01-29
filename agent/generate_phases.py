@@ -63,8 +63,6 @@ def generate_rule_based_phases(net_path):
     for i in range(num_signals):
         signal_angles[i] = get_signal_angle(i, signal_to_lanes, net)
 
-    print(f"Detected {num_signals} signals.")
-
     all_candidates = list(itertools.product([0, 1], repeat=num_signals)) #Generate all possible combinations of phases, ready to be pruned
     valid_phase_strings = [] #We now need to prune
 
@@ -148,7 +146,7 @@ def generate_rule_based_phases(net_path):
 
     unique_phases = sorted(list(set(valid_phase_strings))) #Remove exact copies from the final list
     
-    print(f"Complete. Found {len(unique_phases)} valid LHD phases.")
+    print(f"Found {len(unique_phases)} valid Traffic phases from {num_signals} total signals.")
     return unique_phases
         
 
