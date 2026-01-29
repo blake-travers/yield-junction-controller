@@ -1,13 +1,31 @@
 import sumolib
 import numpy as np
 import itertools
-from adjacency_matrix import get_adjacency_matrices
+import torch
+from agent.adjacency_matrix import get_adjacency_matrices
+import math
 
 #In a merge / give way, Straight has right of way, followed by LEFT and the RIGHT
 #Based upon AUS / UK laws, RIGHT TURNS can only intersect with STRAIGHTS under one of the two possible conditions
 LEFT_TURNS =  {0, 4, 7, 11} #Left turns never intersect with each other
 STRAIGHTS =   {1, 2, 8, 9, 5, 12} #Intersecting Straight turns CANNOT be in the same phase
 RIGHT_TURNS = {3, 6, 10, 13} #Intersecting Right turns CANNOT be in the same phase
+
+def get_signal_angle(idx, signal_to_lanes_map, net): #helper function to determine the angle - exclusively for allowing certain right yield into straight rules
+    lanes = signal_to_lanes_map[idx]
+    if not lanes: return 0.0
+    
+    internal_lane_id = lanes[0]
+    internal_lane = net.getLane(internal_lane_id)
+    
+    if internal_lane.getIncoming():
+        incoming_lane = internal_lane.getIncoming()[0]
+        shape = incoming_lane.getShape()
+        
+        p1, p2 = shape[0], shape[-1]
+        angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0]) * 180 / math.pi
+        return angle
+    return 0.0
 
 def generate_rule_based_phases(net_path):
     print("Generating adjacency matrices...")
@@ -40,7 +58,10 @@ def generate_rule_based_phases(net_path):
     # Clean up empty indices if any
     signal_to_lanes = {k: v for k, v in signal_to_lanes.items() if k <= real_max_index}
     num_signals = real_max_index + 1
-    # --- FIX END ---
+
+    signal_angles = {} #For right turn legality logic
+    for i in range(num_signals):
+        signal_angles[i] = get_signal_angle(i, signal_to_lanes, net)
 
     print(f"Detected {num_signals} signals.")
 
@@ -69,17 +90,49 @@ def generate_rule_based_phases(net_path):
                             if c > max_conflict: max_conflict = c
                 
                 if max_conflict > 0.9: #If Intersecting, there is only one very specific case in which we can allow this phase
-                    if (idx1 in RIGHT_TURNS and idx2 in STRAIGHTS): #And that is when we are turning right when the other guys is turning Left (TODO Prune this step further for AUS road rules!)
-                        must_yield.add(idx1) #Add this right trurn into one of the yield conditions
+                    if (idx1 in RIGHT_TURNS and idx2 in STRAIGHTS):
+                        ang1 = signal_angles[idx1] #Get both Approach Angles
+                        ang2 = signal_angles[idx2]
+                        
+                        diff = abs(ang1 - ang2) % 360
+                        if diff > 180: diff = 360 - diff
+                        
+                        if diff > 135: #If are opposing, we allow
+                            must_yield.add(idx1)
+                        else: #If perpendicular, we do not allow
+                            is_safe = False
+                            break
+
                     elif (idx1 in STRAIGHTS and idx2 in RIGHT_TURNS): #Dont care about other way around because that is already considered in the original pair loop
-                         pass 
+                        ang1 = signal_angles[idx1]
+                        ang2 = signal_angles[idx2]
+                        diff = abs(ang1 - ang2) % 360
+                        if diff > 180: diff = 360 - diff
+                        
+                        if diff > 135: #Other way around
+                             pass
+                        else:
+                             is_safe = False
+                             break
+                        
                     else: #Any other case, ban it
                         is_safe = False
                         break
 
-                elif max_conflict > 0.4: #If we need to merge instead, add left turns to yields
+                elif max_conflict > 0.4: #Means there is a merge - apply give way logic but prevent right turning into merge
                     if idx1 in LEFT_TURNS and idx2 in STRAIGHTS:
                         must_yield.add(idx1)
+                    elif idx1 in STRAIGHTS and idx2 in LEFT_TURNS:
+                        pass 
+                    
+                    elif (idx1 in RIGHT_TURNS and idx2 in STRAIGHTS) or \
+                         (idx1 in STRAIGHTS and idx2 in RIGHT_TURNS):
+                        is_safe = False
+                        break
+                        
+                    else:
+                        is_safe = False
+                        break
 
             if not is_safe: break
         
@@ -99,8 +152,47 @@ def generate_rule_based_phases(net_path):
     return unique_phases
         
 
+def create_phase_mask(net_file, phases, node_list):
+    """
+    Creates a mask that translates lane scores into valid phases
+    """
+    net = sumolib.net.readNet(net_file, withInternal=True)
+    tls = net.getTrafficLights()[0]
+    
+    link_to_lane = {}
+    
+    for conn in tls.getConnections():
+        in_lane = conn[0]
+        out_lane = conn[1]
+        link_idx = conn[2]
+        
+        for outgoing_conn in in_lane.getOutgoing():
+            if (outgoing_conn.getToLane() == out_lane) and \
+               (outgoing_conn.getTLLinkIndex() == link_idx):
+                
+                via_id = outgoing_conn.getViaLaneID()
+                link_to_lane[link_idx] = via_id
+                break
+
+    num_phases = len(phases)
+    num_lanes = len(node_list)
+    mask = torch.zeros(num_phases, num_lanes)
+    
+    node_to_idx = {node: i for i, node in enumerate(node_list)}
+    
+    for p_idx, phase_str in enumerate(phases):
+        for char_idx, char in enumerate(phase_str):
+            if char.lower() == 'g':
+                target_lane_id = link_to_lane.get(char_idx)
+                
+                if target_lane_id in node_to_idx:
+                    matrix_idx = node_to_idx[target_lane_id]
+                    mask[p_idx, matrix_idx] = 1.0
+                    
+    return mask
+
 if __name__ == "__main__":
     phases = generate_rule_based_phases("environment/basic_intersection.net.xml")
-    for i, p in enumerate(phases[:1000]):
-        if i % 100 == 0:
+    for i, p in enumerate(phases):
+        if i % 50 == 0:
             print(f"{i}: {p}")
