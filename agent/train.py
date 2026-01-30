@@ -6,6 +6,7 @@ import traci
 import sumolib
 from collections import deque
 import time
+import random
 
 #TODO: Cars turning right currently spawn in the left lane, need to fix routing
 
@@ -13,6 +14,7 @@ from agent.agent import DoubleDQNAgent, PrioritisedReplayBuffer
 from agent.vehicle import Vehicle
 from agent.adjacency_matrix import get_adjacency_matrices
 from agent.generate_phases import generate_rule_based_phases, create_phase_mask
+from environment.generate_routes import generate_routes
 
 SUMO_CFG = "environment/sim.sumocfg"
 NET_FILE = "environment/basic_intersection.net.xml"
@@ -25,7 +27,7 @@ EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY = 0.97
 MEMORY_SIZE = 50000
-REWARD_MODIFIER = 0.01
+REWARD_MODIFIER = 0.1
 
 GREEN_DURATION = 35
 YELLOW_DURATION = 15
@@ -143,7 +145,9 @@ class SumoIntersectionEnv:
         """
         Reward for now is just the cars that make it through.
         """
-        return float(self.throughput_this_step * REWARD_MODIFIER)
+        wait_time_total = sum([traci.vehicle.getAccumulatedWaitingTime(v) for v in self.active_vehicles])
+        reward = self.throughput_this_step - wait_time_total*0.1
+        return reward * REWARD_MODIFIER
     
 
 if __name__ == "__main__":
@@ -166,6 +170,10 @@ if __name__ == "__main__":
     print(f"Starting Training on {DEVICE}...")
     
     for episode in range(1, 100):
+
+        seed = random.randint(0, 1000000)
+        generate_routes(seed)
+
         state = env.reset()
         episode_start = time.time()
 
@@ -177,10 +185,11 @@ if __name__ == "__main__":
             "td_error": [],
             "q_mean": [],
             "throughput": 0,
-            "action_counts": {}
+            "action_counts": {},
+            "route_seed": seed
         }
         
-        for t in range(EPISODE_LENGTH//(GREEN_DURATION+YELLOW_DURATION)): #Number of updates
+        for timestep in range(EPISODE_LENGTH//(GREEN_DURATION+YELLOW_DURATION)): #Number of updates
             
             action_idx = agent.select_action(state, epsilon)
             next_state, reward, done, info = env.step(action_idx)

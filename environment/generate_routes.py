@@ -1,37 +1,35 @@
 import os
 import sys
 import sumolib
+import random 
 
-def generate_routes():
-
+def generate_routes(seed):
     net_file = "environment/basic_intersection.net.xml"
     route_file = "environment/traffic.rou.xml"
 
     try:
-        # sumolib.checkBinary('sumo') gives path to bin/sumo
-        # .rsplit(..., 2)[0] goes up two levels to find the SUMO_HOME root
         sumo_binary = sumolib.checkBinary('sumo')
         sumo_home = os.path.dirname(os.path.dirname(sumo_binary))
         random_trips_path = os.path.join(sumo_home, 'tools', 'randomTrips.py')
     except Exception:
-        # Fallback if standard install structure is different
         if 'SUMO_HOME' in os.environ:
              random_trips_path = os.path.join(os.environ['SUMO_HOME'], 'tools', 'randomTrips.py')
         else:
-             sys.exit("Error: Could not find SUMO_HOME. Please set it or ensure sumolib is installed.")
+             sys.exit("Error: Could not find SUMO_HOME.")
 
-    # 4. Run the command using absolute paths
-    # We wrap paths in quotes "" to handle any potential spaces in folder names
-    cmd = f'python "{random_trips_path}" -n "{net_file}" -r "{route_file}" -e 3600 -p 2 --trip-attributes "departLane=\'best\'"'
+    # 2. Add the --seed flag and --quiet to keep logs clean
+    # We use -p 2 (period) to define traffic density. 
+    # Lower -p = higher density.
+    cmd = (f'python "{random_trips_path}" '
+           f'-n "{net_file}" '
+           f'-r "{route_file}" '
+           f'-e 360 '
+           f'-p 2 '
+           f'--seed {seed} '
+           f'--trip-attributes "departLane=\'best\'" ')
 
-    print(f"Generating routes in: {route_file}")
     os.system(cmd)
-    
-    # 5. Verify it worked
-    if os.path.exists(route_file):
-        print("Success! 'traffic.rou.xml' is safely inside the environment folder.")
-    else:
-        print("Error: The file was not created. Check the command output above.")
 
 if __name__ == "__main__":
-    generate_routes()
+    seed = random.randint(0, 1000000)
+    generate_routes(seed)
