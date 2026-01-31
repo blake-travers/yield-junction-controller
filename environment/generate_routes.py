@@ -3,7 +3,7 @@ import sys
 import sumolib
 import random 
 
-def generate_routes(seed):
+def generate_routes(seed, length, frequency):
     net_file = "environment/basic_intersection.net.xml"
     route_file = "environment/traffic.rou.xml"
 
@@ -23,13 +23,12 @@ def generate_routes(seed):
     cmd = (f'python "{random_trips_path}" '
            f'-n "{net_file}" '
            f'-r "{route_file}" '
-           f'-e 360 '
-           f'-p 2 '
+           f'-e {length} '
+           f'-p {frequency} '
            f'--seed {seed} '
            f'--trip-attributes "departLane=\'best\'" ')
 
-    os.system(cmd)
+    os.system(cmd + " > /dev/null 2>&1")
 
 if __name__ == "__main__":
-    seed = random.randint(0, 1000000)
-    generate_routes(seed)
+    generate_routes(random.randint(0, 1000000), 360, 4)

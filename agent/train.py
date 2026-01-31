@@ -7,8 +7,7 @@ import sumolib
 from collections import deque
 import time
 import random
-
-#TODO: Cars turning right currently spawn in the left lane, need to fix routing
+import contextlib
 
 from agent.agent import DoubleDQNAgent, PrioritisedReplayBuffer
 from agent.vehicle import Vehicle
@@ -21,13 +20,17 @@ NET_FILE = "environment/basic_intersection.net.xml"
 SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"] # "sumo-gui" to watch / "sumo" to train
 
 BATCH_SIZE = 64
-GAMMA = 0.98
-EPISODE_LENGTH = 3600 #TODO Prevent hardcode
+GAMMA = 0.75
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 0.97
+EPS_DECAY = 0.98
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.1
+
+EPISODE_LENGTH = 360
+EPISODE_NUMBER = 500
+EPISODE_PRINT_FREQUENCY = 1
+CAR_SPAWN_FREQUENCY = 4
 
 GREEN_DURATION = 35
 YELLOW_DURATION = 15
@@ -54,9 +57,15 @@ class SumoIntersectionEnv:
         try: traci.close()
         except: pass
 
-        traci.start(self.sumo_cmd)
+
+        with open(os.devnull, 'w') as fnull:
+            with contextlib.redirect_stderr(fnull), contextlib.redirect_stdout(fnull):
+                traci.start(self.sumo_cmd)
+                
         self.tls_id = traci.trafficlight.getIDList()[0]
         self.active_vehicles = {}
+
+        self.start_sim_time = traci.simulation.getTime()
         
         for _ in range(10):
             self._sim_step()
@@ -137,7 +146,7 @@ class SumoIntersectionEnv:
                 dir_vec = car.getDirection() #Get the direction of this car
                 lane_grid[cell_idx] = dir_vec #Populate the index with this direction vector
             
-            batch_features.append(lane_grid.flatten()) #Flatten for MLP
+            batch_features.append(lane_grid) #Flatten for MLP
 
         return torch.tensor(np.array([batch_features]), dtype=torch.float32).to(DEVICE)
 
@@ -145,18 +154,43 @@ class SumoIntersectionEnv:
         """
         Reward for now is just the cars that make it through.
         """
-        wait_time_total = sum([traci.vehicle.getAccumulatedWaitingTime(v) for v in self.active_vehicles])
-        reward = self.throughput_this_step - wait_time_total*0.1
+
+        reward = self.throughput_this_step - len(self.active_vehicles)*0.15
+        #print(self.throughput_this_step, len(self.active_vehicles)*0.15)
         return reward * REWARD_MODIFIER
-    
+
+def aggregate_print_metrics(ep_metrics):
+    avg_loss = np.mean(ep_metrics["loss"]) if ep_metrics["loss"] else 0.0
+    reward = ep_metrics["reward"] / EPISODE_PRINT_FREQUENCY if ep_metrics["reward"] else 0.0
+    avg_queue = np.mean(ep_metrics["queue_len"])
+    avg_wait = np.mean(ep_metrics["wait_time"])
+    avg_flush = ep_metrics["extra_timesteps"] / EPISODE_PRINT_FREQUENCY
+    avg_td = np.mean(ep_metrics["td_error"]) if ep_metrics["td_error"] else 0
+    avg_q = np.mean(ep_metrics["q_mean"]) if ep_metrics["q_mean"] else 0
+    epsilon_mean = np.mean(ep_metrics["epsilon"]) if ep_metrics["epsilon"] else 0
+
+    print("-" * 120)
+    print(f"{f'Episodes: {(ep_metrics["episode"]+1-EPISODE_PRINT_FREQUENCY):03d}-{ep_metrics["episode"]:03d}':<{26}} |")
+
+    print(f"{f'  Duration: {ep_metrics["duration"]:8.1f}s':<{26}} | "
+        f"{f'Epsilon Mean: {epsilon_mean:7.3f}':<{21}} | "
+        f"{f'Reward Mean: {reward:3.3f}':<{21}} | "
+        f"{f'Average Loss: {avg_loss:9.4f}'}")
+
+    print(f"{f'  Queue Length: {avg_queue:4.1f} cars':<{26}} | "
+        f"{f'Time to Flush: {avg_flush:4.0f}':<{21}} | "
+        f"{f'Average TD: {avg_td:3.3f}':<{21}} | "
+        f"{f'Average Lane Q: {avg_q:7.4f}'}")
 
 if __name__ == "__main__":
-    print("Loading Graph Aadjacency matrices...")
+    print("Loading Graph Adjacency matrices...")
     nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
     
     print("Generating valid Traffic light phases...")
+    internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
+    internal_nodes = [nodes[i] for i in internal_indices]
     phases = generate_rule_based_phases(NET_FILE)
-    phase_mask = create_phase_mask(NET_FILE, phases, nodes)
+    phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes)
     
     print("Setting up Intersection Environment...")
     env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes)
@@ -167,16 +201,8 @@ if __name__ == "__main__":
     epsilon = EPS_START
     step_count = 0
     
-    print(f"Starting Training on {DEVICE}...")
-    
-    for episode in range(1, 100):
-
-        seed = random.randint(0, 1000000)
-        generate_routes(seed)
-
-        state = env.reset()
-        episode_start = time.time()
-
+    print(f"Starting Training on {DEVICE}... Max Reward value for these settings = {((EPISODE_LENGTH / CAR_SPAWN_FREQUENCY) * REWARD_MODIFIER):.1f}")
+    for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
         ep_metrics = {
             "reward": 0,
             "loss": [],
@@ -186,50 +212,62 @@ if __name__ == "__main__":
             "q_mean": [],
             "throughput": 0,
             "action_counts": {},
-            "route_seed": seed
+            "epsilon": [],
+            "episode": 0,
+            "episode_start": 0,
+            "extra_timesteps": 0
         }
-        
-        for timestep in range(EPISODE_LENGTH//(GREEN_DURATION+YELLOW_DURATION)): #Number of updates
-            
-            action_idx = agent.select_action(state, epsilon)
-            next_state, reward, done, info = env.step(action_idx)
-            memory.push(state, action_idx, reward, next_state, done)
-            metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.4)
-            agent.update_target_network(tau=0.005) #Update the target network slightly
-            
-            state = next_state
+        episode_start = time.time()
+        for episode in range(0, EPISODE_PRINT_FREQUENCY):
 
-            ep_metrics["reward"] += reward
-            ep_metrics["throughput"] += info["throughput"]
-            ep_metrics["queue_len"].append(info["queue_len"])
-            ep_metrics["wait_time"].append(info["avg_wait"])
-            if metrics is not None:
+            seed = random.randint(0, 1000000)
+            generate_routes(seed, EPISODE_LENGTH, CAR_SPAWN_FREQUENCY)
+
+            state = env.reset()
+            
+
+            done = False
+            step = 0
+
+            while not done: #Go until no more active vehicles
+                
+                current_sim_time = traci.simulation.getTime()
+                if current_sim_time >= EPISODE_LENGTH and traci.simulation.getMinExpectedNumber() == 0:
+                    ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
+                    done = True
+
+                action_idx = agent.select_action(state, epsilon)
+                next_state, reward, _, info = env.step(action_idx)
+                memory.push(state, action_idx, reward, next_state, done)
+                metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
+                agent.update_target_network(tau=0.001) #Update the target network slightly
+                
+                state = next_state
+
+                ep_metrics["reward"] += reward
+                ep_metrics["throughput"] += info["throughput"]
+                ep_metrics["queue_len"].append(info["queue_len"])
+                ep_metrics["wait_time"].append(info["avg_wait"])
                 ep_metrics["loss"].append(metrics["loss"])
                 ep_metrics["td_error"].append(metrics["td_error"])
                 ep_metrics["q_mean"].append(metrics["q_mean"])
-            ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
+                ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
-        
-        epsilon = max(EPS_END, epsilon * EPS_DECAY)
-        
-        avg_loss = np.mean(ep_metrics["loss"]) if ep_metrics["loss"] else 0.0
-        avg_queue = np.mean(ep_metrics["queue_len"])
-        avg_wait = np.mean(ep_metrics["wait_time"])
-        duration = time.time() - episode_start
-        avg_td = np.mean(ep_metrics["td_error"]) if ep_metrics["td_error"] else 0
-        avg_q = np.mean(ep_metrics["q_mean"]) if ep_metrics["q_mean"] else 0
+                step += 1
 
-        print("-" * 60)
-        print(f"Episode {episode:02d}")
-        print(f"  Time: {duration:.0f}s")
-        print(f"  Epsilon: {epsilon:.3f}")
-        print(f"  Reward: {ep_metrics['reward']:.1f}")
-        print(f"  Average Queue length: {avg_queue:.1f} cars")
-        print(f"  Average Wait time: {avg_wait:.1f}s")
-        print(f"  Loss: {avg_loss:.4f}")
-        print(f"  Average TD Error: {avg_td:.4f}")
-        print(f"  Average Lane Q-value: {avg_q:.4f}")
-        #print(f"  Actions: {dict(sorted(ep_metrics['action_counts'].items()))}")
+            ep_metrics["epsilon"].append(epsilon)
+            epsilon = max(EPS_END, epsilon * EPS_DECAY)
+            agent.scheduler.step()
+
+        ep_metrics["episode"] = print_episode*EPISODE_PRINT_FREQUENCY
+        ep_metrics["duration"] = time.time() - episode_start
         
+        
+
+        aggregate_print_metrics(ep_metrics)
 
     print("Training Complete.")
+
+
+#TODO: Individual Lane Loss
+#TODO: Quicker Q value plateau - currently it takes about 20 minutes for the q value to plateau and the model to even start training

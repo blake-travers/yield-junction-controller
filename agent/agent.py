@@ -82,11 +82,20 @@ class DoubleDQNAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict()) #Make the target net identical to the policy first time
         self.target_net.eval()
         
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4) #High learning rate to speed through Q value increases
+
+        self.scheduler = optim.lr_scheduler.MultiStepLR( #Scheduler to reduce by 3 times twice
+            self.optimizer, 
+            milestones=[20, 50], 
+            gamma=0.3
+        )
+
         self.loss_fn = nn.SmoothL1Loss()
 
     def _get_phase_q_values(self, lane_q_values): #Sum up the lane q values to get the highest phase
-        phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t()) / self.num_lanes
+
+        num_scored_lanes = lane_q_values.size(1)
+        phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t()) / num_scored_lanes
         return phase_q_values
 
     def select_action(self, state, epsilon):

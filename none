@@ -1,0 +1,5 @@
+***Starting server on port 36687 ***
+Loading net-file from 'environment/basic_intersection.net.xml' ... done (0ms).
+Loading route-files incrementally from 'environment/traffic.rou.xml'
+Loading done.
+Simulation version 1.25.0 started with time: 0.00.

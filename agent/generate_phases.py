@@ -153,7 +153,11 @@ def generate_rule_based_phases(net_path):
 def create_phase_mask(net_file, phases, node_list):
     """
     Creates a mask that translates lane scores into valid phases
+    Node list MUST be of length 14 for this intersection
     """
+
+    assert len(node_list) == 14
+    
     net = sumolib.net.readNet(net_file, withInternal=True)
     tls = net.getTrafficLights()[0]
     
