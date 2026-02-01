@@ -17,10 +17,10 @@ class PrioritisedReplayBuffer:
         self.priorities = np.zeros((capacity,), dtype=np.float32) #List of priorities capacity long
         self.pos = 0 #We use position instead of queue becuase it is lower complexity O(1) instead of O(n)
 
-    def push(self, state, action, reward, next_state, done): #Push this new memory 
+    def push(self, state, action, reward, next_state, phase, next_phase, done): #Push this new memory 
         max_prio = self.priorities.max() if self.buffer else 1.0 #Ensure new memories are important
         
-        experience = (state, action, reward, next_state, done)
+        experience = (state, action, reward, next_state, phase, next_phase, done)
         
         if len(self.buffer) < self.capacity: #If there is space, add
             self.buffer.append(experience)
@@ -62,7 +62,7 @@ class PrioritisedReplayBuffer:
             self.priorities[idx] = prio
 
 class DoubleDQNAgent:
-    def __init__(self, num_lanes, num_phases, input_dim, adj_flow, adj_conf, phase_mask, device):
+    def __init__(self, num_lanes, scoreable_lanes, num_phases, input_dim, adj_flow, adj_conf, phase_mask, device):
         """
         phase_mask: Bool Tensor [Num_Phases, Num_Lanes]. 1 if lane is Green in phase.
         adj_flow/conf: The adjacency matrices for the GNN.
@@ -76,8 +76,8 @@ class DoubleDQNAgent:
         self.adj_flow = adj_flow.to(device)
         self.adj_conf = adj_conf.to(device)
 
-        self.policy_net = TrafficGNN(input_dim, hidden_dim=64).to(device) #Create Policy and Target net
-        self.target_net = TrafficGNN(input_dim, hidden_dim=64).to(device)
+        self.policy_net = TrafficGNN(input_dim, output_dim=scoreable_lanes, num_lanes=num_lanes).to(device) #Create Policy and Target net
+        self.target_net = TrafficGNN(input_dim, output_dim=scoreable_lanes, num_lanes=num_lanes).to(device)
         
         self.target_net.load_state_dict(self.policy_net.state_dict()) #Make the target net identical to the policy first time
         self.target_net.eval()
@@ -98,7 +98,7 @@ class DoubleDQNAgent:
         phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t()) / num_scored_lanes
         return phase_q_values
 
-    def select_action(self, state, epsilon):
+    def select_action(self, state, phase, epsilon):
         """
         Select an phase based upon the current state and the policy net
         """
@@ -107,7 +107,9 @@ class DoubleDQNAgent:
         
         with torch.no_grad():
             state = state.to(self.device)
-            lane_q = self.policy_net(state, self.adj_flow, self.adj_conf)
+            phase = phase.to(self.device)
+
+            lane_q = self.policy_net(state, self.adj_flow, self.adj_conf, phase)
             phase_q = self._get_phase_q_values(lane_q)
             return phase_q.argmax(dim=1).item()
 
@@ -116,28 +118,30 @@ class DoubleDQNAgent:
         batch, indices, weights = buffer.sample(batch_size, beta)
         if batch is None: return 0.0
         
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards, next_states, phases, next_phases, dones = batch
         
         #Fix & Convert shapes into a useable format for torch
         states = torch.cat(states).to(self.device)
         next_states = torch.cat(next_states).to(self.device)
         actions = torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1)
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(1)
+        phases = torch.cat(phases).to(self.device)
+        next_phases = torch.cat(next_phases).to(self.device)
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device).unsqueeze(1)
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device).unsqueeze(1)
 
 
-        current_lane_q = self.policy_net(states, self.adj_flow, self.adj_conf)
+        current_lane_q = self.policy_net(states, self.adj_flow, self.adj_conf, phases)
         current_phase_q_all = self._get_phase_q_values(current_lane_q) #Get the all the Q phase values represented by the policy net
         current_q = current_phase_q_all.gather(1, actions)
         q_mean = current_q.mean().item()
 
         with torch.no_grad():
-            next_lane_q_policy = self.policy_net(next_states, self.adj_flow, self.adj_conf)
+            next_lane_q_policy = self.policy_net(next_states, self.adj_flow, self.adj_conf, next_phases)
             next_phase_q_policy = self._get_phase_q_values(next_lane_q_policy) #Figure out the possible phase q values for each of the next states
             best_next_actions = next_phase_q_policy.argmax(dim=1).unsqueeze(1) #Figure out the best actions for the next states using the policy net
             
-            next_lane_q_target = self.target_net(next_states, self.adj_flow, self.adj_conf)
+            next_lane_q_target = self.target_net(next_states, self.adj_flow, self.adj_conf, next_phases)
             next_phase_q_target = self._get_phase_q_values(next_lane_q_target) #Determine the target phase based upon the target net
             next_q_value = next_phase_q_target.gather(1, best_next_actions) #Figure out the q value from the previous policy actions
             

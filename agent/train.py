@@ -20,7 +20,7 @@ SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log",
 SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"]
 
 BATCH_SIZE = 64
-GAMMA = 0.75
+GAMMA = 0.9
 EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY = 0.98
@@ -29,15 +29,16 @@ REWARD_MODIFIER = 0.1
 
 EPISODE_LENGTH = 360
 EPISODE_NUMBER = 200
-EPISODE_PRINT_FREQUENCY = 5
+EPISODE_PRINT_FREQUENCY = 1
 CAR_SPAWN_FREQUENCY = 4
 
-GREEN_DURATION = 35
-YELLOW_DURATION = 15
+DECISION_FREQUENCY = 50
 CELL_LENGTH = 1
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
 FEATURES = 3 #Just Direction for now
+SCOREABLE_LANES = 14
+NUM_LANES = 26
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -63,6 +64,18 @@ class SumoIntersectionEnv:
                 traci.start(self.sumo_cmd)
                 
         self.tls_id = traci.trafficlight.getIDList()[0]
+
+        self.internal_lane_ids = [lane for lane in self.lane_list if ":" in lane] #Grab the Internal lanes
+        controlled_links = traci.trafficlight.getControlledLinks(self.tls_id) #Grab the traci-linked lights
+        self.lane_to_str_idx = {}
+
+        for string_idx, links in enumerate(controlled_links): #For each controlled link
+            for link in links:
+                lane_id = link[0] #Get the id
+                if lane_id in self.internal_lane_ids: #Map the id to the internal lane
+                    self.lane_to_str_idx[lane_id] = string_idx
+
+
         self.active_vehicles = {}
 
         self.start_sim_time = traci.simulation.getTime()
@@ -72,13 +85,13 @@ class SumoIntersectionEnv:
             
         return self.get_state()
 
-    def step(self, action_idx):
+    def step(self, action_idx, done):
         target_phase = self.phases[action_idx]
         current_phase = traci.trafficlight.getRedYellowGreenState(self.tls_id)
         
         self.throughput_this_step = 0
         
-        if target_phase != current_phase:
+        if target_phase != current_phase: #If changing phases
             y_state = list(current_phase)
             for i in range(len(current_phase)):
                 if current_phase[i].lower() == 'g' and target_phase[i].lower() == 'r':
@@ -86,19 +99,19 @@ class SumoIntersectionEnv:
             y_str = "".join(y_state)
             
             traci.trafficlight.setRedYellowGreenState(self.tls_id, y_str)
-            for _ in range(YELLOW_DURATION):
-                # Accumulate finished cars during Yellow
+            
+            for _ in range(DECISION_FREQUENCY): #Assuming that YELLOW duration = DECISION FREQUENCY
                 self.throughput_this_step += self._sim_step()
-        
-        traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase)
-        
-        for _ in range(GREEN_DURATION):
-            # Accumulate finished cars during Green
-            self.throughput_this_step += self._sim_step()
+            
+            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase) #Set target phase for next step logic
+            
+        else: #If staying the same, run the same for another 10 timesteps
+            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase)
+            for _ in range(DECISION_FREQUENCY):
+                self.throughput_this_step += self._sim_step()
             
         next_state = self.get_state()
-        reward = self.get_reward()
-        done = False
+        reward = self.get_reward(done)
 
         current_queue_len = len(self.active_vehicles)
         total_system_wait = sum([v.wait_time for v in self.active_vehicles.values()])
@@ -110,7 +123,7 @@ class SumoIntersectionEnv:
             "throughput": self.throughput_this_step
         }
         
-        return next_state, reward, done, info
+        return next_state, reward, info
 
     def _sim_step(self):
         traci.simulationStep()
@@ -149,15 +162,35 @@ class SumoIntersectionEnv:
             batch_features.append(lane_grid) #Flatten for MLP
 
         return torch.tensor(np.array([batch_features]), dtype=torch.float32).to(DEVICE)
-
-    def get_reward(self):
+    
+    def get_phase_vector(self):
         """
-        Reward for now is just the cars that make it through.
+        Returns a [1, 14] tensor representing the current Green/Red status 
+        of the 14 internal lanes.
         """
+        phase_str = traci.trafficlight.getRedYellowGreenState(self.tls_id) #Get the current phase string
+        
+        phase_vec = []
+        for lane_id in self.internal_lane_ids: #For each internal lane id
+            idx = self.lane_to_str_idx.get(lane_id) #Get the mapping
+            if idx is not None and idx < len(phase_str):
+                is_green = 1.0 if phase_str[idx].lower() == 'g' else 0.0  #If green population index with 1, else 0
+            else:
+                is_green = 0.0
 
-        reward = self.throughput_this_step - len(self.active_vehicles)*0.15
-        #print(self.throughput_this_step, len(self.active_vehicles)*0.15)
-        return reward * REWARD_MODIFIER
+            phase_vec.append(is_green)
+
+        return torch.tensor([phase_vec], dtype=torch.float32).to(DEVICE)
+
+    def get_reward(self, done):
+        if done == None:
+            reward = self.throughput_this_step - len(self.active_vehicles)*0.03# - 0.1
+            #print(self.throughput_this_step, len(self.active_vehicles)*0.15)
+            return reward * REWARD_MODIFIER
+        elif done == "success":
+            return 5
+        elif done == "timeout":
+            return -5
 
 def aggregate_print_metrics(ep_metrics):
     avg_loss = np.mean(ep_metrics["loss"]) if ep_metrics["loss"] else 0.0
@@ -185,6 +218,7 @@ def aggregate_print_metrics(ep_metrics):
 def train_agent():
     print("Loading Graph Adjacency matrices...")
     nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
+    assert len(nodes) == NUM_LANES
     
     print("Generating valid Traffic light phases...")
     internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
@@ -195,7 +229,7 @@ def train_agent():
     print("Setting up Intersection Environment...")
     env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes)
     
-    agent = DoubleDQNAgent(num_lanes=len(nodes), num_phases=len(phases), input_dim=NUM_CELLS * FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
+    agent = DoubleDQNAgent(num_lanes=NUM_LANES, scoreable_lanes=SCOREABLE_LANES, num_phases=len(phases), input_dim=FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
     
     epsilon = EPS_START
@@ -223,25 +257,29 @@ def train_agent():
             generate_routes(seed, EPISODE_LENGTH, CAR_SPAWN_FREQUENCY)
 
             state = env.reset()
-            
 
-            done = False
+            done = None
             step = 0
+            current_phase = env.get_phase_vector() #Get initial phase
 
-            while not done: #Go until no more active vehicles
+            while True: #Go until no more active vehicles. As soon as "done" is true we break
                 
                 current_sim_time = traci.simulation.getTime()
                 if current_sim_time >= EPISODE_LENGTH and traci.simulation.getMinExpectedNumber() == 0:
-                    ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
-                    done = True
+                    done = "success"
 
-                action_idx = agent.select_action(state, epsilon)
-                next_state, reward, _, info = env.step(action_idx)
-                memory.push(state, action_idx, reward, next_state, done)
+                elif current_sim_time >= EPISODE_LENGTH * 5: 
+                    done = "timeout"
+
+                action_idx = agent.select_action(state, current_phase, epsilon)
+                next_state, reward, info = env.step(action_idx, done)
+                next_phase = env.get_phase_vector() #Get next phase based upon this action
+                memory.push(state, action_idx, reward, next_state, current_phase, next_phase, False if done is None else True)
                 metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
                 agent.update_target_network(tau=0.001) #Update the target network slightly
                 
                 state = next_state
+                current_phase = next_phase
 
                 ep_metrics["reward"] += reward
                 ep_metrics["throughput"] += info["throughput"]
@@ -253,6 +291,11 @@ def train_agent():
                 ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
                 step += 1
+
+                if done is not None:
+                    ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
+                    break
+
 
             ep_metrics["epsilon"].append(epsilon)
             epsilon = max(EPS_END, epsilon * EPS_DECAY)
@@ -277,7 +320,7 @@ def watch_agent():
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
     env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD, phases, nodes)
 
-    model = TrafficGNN(input_dim=NUM_CELLS * FEATURES, hidden_dim=64).to(DEVICE)
+    model = TrafficGNN(input_dim=FEATURES, output_dim=SCOREABLE_LANES, num_lanes=NUM_LANES).to(DEVICE)
     model.load_state_dict(torch.load("traffic_gnn_model.pth"))
     model.eval() 
 
@@ -292,11 +335,9 @@ def watch_agent():
     while not done:
         with torch.no_grad():
             # Get lane priorities from the GNN
-            lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE))
+            lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE), env.get_phase_vector())
             
-            # Use the same math as the agent to pick the best phase
-            # lane_q is [1, 14], phase_mask is [848, 14]
-            phase_q = torch.matmul(lane_q, phase_mask.t()) / 14 
+            phase_q = torch.matmul(lane_q, phase_mask.t()) / SCOREABLE_LANES  #Pick the best phase
             action_idx = phase_q.argmax(dim=1).item()
             
         state, reward, _, info = env.step(action_idx)
@@ -310,11 +351,14 @@ def watch_agent():
     traci.close()
 
 if __name__ == "__main__":
-    #train_agent()
+    train_agent()
     watch_agent()
 
 #TODO:
 #   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted
 #   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency)
+#           - Allow the Agent to "See" Current lights and make decisions around that [DONE]
+#           - Increase the Training Frequency
+#           - Increase Vehicle Randomness / Reduce Traffic light changing efficiency
 #   [HIGH] Write a detailed Report (should aim for 6-10 pages) not something honours worthy, just something assignment worthy that can put into github + cv
 #   [MEDIUM] Limit the maximum output per lane - see if the model can figure out that overflowing the output lane and clogging up the intersection is a bad idea
