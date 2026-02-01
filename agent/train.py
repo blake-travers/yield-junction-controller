@@ -1,10 +1,8 @@
 import os
-import sys
 import torch
 import numpy as np
 import traci
 import sumolib
-from collections import deque
 import time
 import random
 import contextlib
@@ -14,10 +12,12 @@ from agent.vehicle import Vehicle
 from agent.adjacency_matrix import get_adjacency_matrices
 from agent.generate_phases import generate_rule_based_phases, create_phase_mask
 from environment.generate_routes import generate_routes
+from agent.modelGNN import TrafficGNN
 
 SUMO_CFG = "environment/sim.sumocfg"
 NET_FILE = "environment/basic_intersection.net.xml"
-SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"] # "sumo-gui" to watch / "sumo" to train
+SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"]
+SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"]
 
 BATCH_SIZE = 64
 GAMMA = 0.75
@@ -28,8 +28,8 @@ MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.1
 
 EPISODE_LENGTH = 360
-EPISODE_NUMBER = 500
-EPISODE_PRINT_FREQUENCY = 1
+EPISODE_NUMBER = 200
+EPISODE_PRINT_FREQUENCY = 5
 CAR_SPAWN_FREQUENCY = 4
 
 GREEN_DURATION = 35
@@ -182,7 +182,7 @@ def aggregate_print_metrics(ep_metrics):
         f"{f'Average TD: {avg_td:3.3f}':<{21}} | "
         f"{f'Average Lane Q: {avg_q:7.4f}'}")
 
-if __name__ == "__main__":
+def train_agent():
     print("Loading Graph Adjacency matrices...")
     nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
     
@@ -199,7 +199,6 @@ if __name__ == "__main__":
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
     
     epsilon = EPS_START
-    step_count = 0
     
     print(f"Starting Training on {DEVICE}... Max Reward value for these settings = {((EPISODE_LENGTH / CAR_SPAWN_FREQUENCY) * REWARD_MODIFIER):.1f}")
     for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
@@ -266,8 +265,56 @@ if __name__ == "__main__":
 
         aggregate_print_metrics(ep_metrics)
 
-    print("Training Complete.")
+    print("Training Complete. Saving Model...")
+    torch.save(agent.policy_net.state_dict(), "traffic_gnn_model.pth")
 
+def watch_agent():
+    # 1. Re-generate the context needed for the model
+    nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
+    internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
+    internal_nodes = [nodes[i] for i in internal_indices]
+    phases = generate_rule_based_phases(NET_FILE)
+    phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD, phases, nodes)
 
-#TODO: Individual Lane Loss
-#TODO: Quicker Q value plateau - currently it takes about 20 minutes for the q value to plateau and the model to even start training
+    model = TrafficGNN(input_dim=NUM_CELLS * FEATURES, hidden_dim=64).to(DEVICE)
+    model.load_state_dict(torch.load("traffic_gnn_model.pth"))
+    model.eval() 
+
+    print("Starting GUI Evaluation...")
+
+    seed = random.randint(0, 1000000)
+    generate_routes(seed, EPISODE_LENGTH*10, CAR_SPAWN_FREQUENCY)
+    
+    state = env.reset()
+    done = False
+
+    while not done:
+        with torch.no_grad():
+            # Get lane priorities from the GNN
+            lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE))
+            
+            # Use the same math as the agent to pick the best phase
+            # lane_q is [1, 14], phase_mask is [848, 14]
+            phase_q = torch.matmul(lane_q, phase_mask.t()) / 14 
+            action_idx = phase_q.argmax(dim=1).item()
+            
+        state, reward, _, info = env.step(action_idx)
+        
+        # Check if simulation time is up and intersection is clear
+        current_sim_time = traci.simulation.getTime()
+        if current_sim_time >= EPISODE_LENGTH and traci.simulation.getMinExpectedNumber() == 0:
+            done = True
+            
+    print(f"Evaluation Run Complete.")
+    traci.close()
+
+if __name__ == "__main__":
+    #train_agent()
+    watch_agent()
+
+#TODO:
+#   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted
+#   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency)
+#   [HIGH] Write a detailed Report (should aim for 6-10 pages) not something honours worthy, just something assignment worthy that can put into github + cv
+#   [MEDIUM] Limit the maximum output per lane - see if the model can figure out that overflowing the output lane and clogging up the intersection is a bad idea
