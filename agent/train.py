@@ -6,6 +6,7 @@ import sumolib
 import time
 import random
 import contextlib
+import matplotlib.pyplot as plt
 
 from agent.agent import DoubleDQNAgent, PrioritisedReplayBuffer
 from agent.vehicle import Vehicle
@@ -23,17 +24,20 @@ BATCH_SIZE = 64
 GAMMA = 0.9
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 0.98
+EPS_DECAY = 0.96
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.1
+INITIAL_TAU = 0.01
+FINAL_TAU = 0.004
 
-EPISODE_LENGTH = 360
+EPISODE_LENGTH = 500
 EPISODE_NUMBER = 200
-EPISODE_PRINT_FREQUENCY = 1
+EPISODE_PRINT_FREQUENCY = 5
 CAR_SPAWN_FREQUENCY = 4
 
-DECISION_FREQUENCY = 50
-CELL_LENGTH = 1
+DECISION_FREQUENCY = 25
+YELLOW_TIME = 5
+CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
 FEATURES = 3 #Just Direction for now
@@ -85,7 +89,7 @@ class SumoIntersectionEnv:
             
         return self.get_state()
 
-    def step(self, action_idx, done):
+    def step(self, action_idx):
         target_phase = self.phases[action_idx]
         current_phase = traci.trafficlight.getRedYellowGreenState(self.tls_id)
         
@@ -96,22 +100,24 @@ class SumoIntersectionEnv:
             for i in range(len(current_phase)):
                 if current_phase[i].lower() == 'g' and target_phase[i].lower() == 'r':
                     y_state[i] = 'y'
-            y_str = "".join(y_state)
             
-            traci.trafficlight.setRedYellowGreenState(self.tls_id, y_str)
+            traci.trafficlight.setRedYellowGreenState(self.tls_id, "".join(y_state))
             
-            for _ in range(DECISION_FREQUENCY): #Assuming that YELLOW duration = DECISION FREQUENCY
+            for _ in range(YELLOW_TIME): #For YELLOW TIME
                 self.throughput_this_step += self._sim_step()
             
-            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase) #Set target phase for next step logic
+            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase) #Now switch all target g to green, and target r to red
+
+            for _ in range(max(0, DECISION_FREQUENCY - YELLOW_TIME)): #For the rest of the duration we step the environment
+                self.throughput_this_step += self._sim_step()
             
-        else: #If staying the same, run the same for another 10 timesteps
+        else: #If staying the same, run the same for another 50 timesteps
             traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase)
             for _ in range(DECISION_FREQUENCY):
                 self.throughput_this_step += self._sim_step()
             
         next_state = self.get_state()
-        reward = self.get_reward(done)
+        reward = self.get_reward()
 
         current_queue_len = len(self.active_vehicles)
         total_system_wait = sum([v.wait_time for v in self.active_vehicles.values()])
@@ -182,15 +188,12 @@ class SumoIntersectionEnv:
 
         return torch.tensor([phase_vec], dtype=torch.float32).to(DEVICE)
 
-    def get_reward(self, done):
-        if done == None:
-            reward = self.throughput_this_step - len(self.active_vehicles)*0.03# - 0.1
-            #print(self.throughput_this_step, len(self.active_vehicles)*0.15)
-            return reward * REWARD_MODIFIER
-        elif done == "success":
-            return 5
-        elif done == "timeout":
-            return -5
+    def get_reward(self):
+
+        total_wait_sq_penalty = sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*0.00002
+        reward = self.throughput_this_step - len(self.active_vehicles)*0.15 - total_wait_sq_penalty
+        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {-len(self.active_vehicles)*0.15:.2f} |  Waiting Penalty Total: {-total_wait_sq_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * REWARD_MODIFIER:.3f}")
+        return reward * REWARD_MODIFIER
 
 def aggregate_print_metrics(ep_metrics):
     avg_loss = np.mean(ep_metrics["loss"]) if ep_metrics["loss"] else 0.0
@@ -233,6 +236,7 @@ def train_agent():
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
     
     epsilon = EPS_START
+    training_history = []
     
     print(f"Starting Training on {DEVICE}... Max Reward value for these settings = {((EPISODE_LENGTH / CAR_SPAWN_FREQUENCY) * REWARD_MODIFIER):.1f}")
     for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
@@ -259,24 +263,20 @@ def train_agent():
             state = env.reset()
 
             done = None
-            step = 0
             current_phase = env.get_phase_vector() #Get initial phase
+            current_sim_time = 0 #Set to zero for first while
 
             while True: #Go until no more active vehicles. As soon as "done" is true we break
-                
+                if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*10:
+                    break
                 current_sim_time = traci.simulation.getTime()
-                if current_sim_time >= EPISODE_LENGTH and traci.simulation.getMinExpectedNumber() == 0:
-                    done = "success"
-
-                elif current_sim_time >= EPISODE_LENGTH * 5: 
-                    done = "timeout"
 
                 action_idx = agent.select_action(state, current_phase, epsilon)
-                next_state, reward, info = env.step(action_idx, done)
+                next_state, reward, info = env.step(action_idx)
                 next_phase = env.get_phase_vector() #Get next phase based upon this action
                 memory.push(state, action_idx, reward, next_state, current_phase, next_phase, False if done is None else True)
                 metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
-                agent.update_target_network(tau=0.001) #Update the target network slightly
+                agent.update_target_network(tau=max(FINAL_TAU, INITIAL_TAU * (epsilon ** 0.2))) #Update the target network slightly
                 
                 state = next_state
                 current_phase = next_phase
@@ -290,26 +290,21 @@ def train_agent():
                 ep_metrics["q_mean"].append(metrics["q_mean"])
                 ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
-                step += 1
-
-                if done is not None:
-                    ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
-                    break
-
-
+            ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
             ep_metrics["epsilon"].append(epsilon)
             epsilon = max(EPS_END, epsilon * EPS_DECAY)
             agent.scheduler.step()
 
         ep_metrics["episode"] = print_episode*EPISODE_PRINT_FREQUENCY
         ep_metrics["duration"] = time.time() - episode_start
-        
+        training_history.append(ep_metrics.copy())
         
 
         aggregate_print_metrics(ep_metrics)
 
     print("Training Complete. Saving Model...")
     torch.save(agent.policy_net.state_dict(), "traffic_gnn_model.pth")
+    plot_training_results(training_history)
 
 def watch_agent():
     # 1. Re-generate the context needed for the model
@@ -340,7 +335,7 @@ def watch_agent():
             phase_q = torch.matmul(lane_q, phase_mask.t()) / SCOREABLE_LANES  #Pick the best phase
             action_idx = phase_q.argmax(dim=1).item()
             
-        state, reward, _, info = env.step(action_idx)
+        state, reward, info = env.step(action_idx)
         
         # Check if simulation time is up and intersection is clear
         current_sim_time = traci.simulation.getTime()
@@ -350,15 +345,51 @@ def watch_agent():
     print(f"Evaluation Run Complete.")
     traci.close()
 
+def plot_training_results(history):
+    episodes = [h["episode"] for h in history]
+    
+    # Extract data
+    mean_rewards = [h["reward"] / EPISODE_PRINT_FREQUENCY for h in history]
+    avg_q_values = [np.mean(h["q_mean"]) for h in history]
+    avg_losses = [np.mean(h["loss"]) if h["loss"] else 0 for h in history]
+    avg_queues = [np.mean(h["queue_len"]) for h in history]
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle('Traffic GNN Training Metrics')
+
+    # Mean Reward
+    axs[0, 0].plot(episodes, mean_rewards, color='green')
+    axs[0, 0].set_title('Mean Reward')
+    axs[0, 0].grid(True)
+
+    # Average Q Value
+    axs[0, 1].plot(episodes, avg_q_values, color='blue')
+    axs[0, 1].set_title('Mean Q-Value')
+    axs[0, 1].grid(True)
+
+    # Loss
+    axs[1, 0].plot(episodes, avg_losses, color='red')
+    axs[1, 0].set_title('Average Loss')
+    axs[1, 0].grid(True)
+
+    # Queue Length
+    axs[1, 1].plot(episodes, avg_queues, color='orange')
+    axs[1, 1].set_title('Average Queue Length')
+    axs[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig("training_metrics.png")
+    plt.show()
+
 if __name__ == "__main__":
-    train_agent()
+    #train_agent()
     watch_agent()
 
 #TODO:
 #   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted
 #   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency)
 #           - Allow the Agent to "See" Current lights and make decisions around that [DONE]
-#           - Increase the Training Frequency
+#           - Increase the Training Frequency [DONE]
 #           - Increase Vehicle Randomness / Reduce Traffic light changing efficiency
 #   [HIGH] Write a detailed Report (should aim for 6-10 pages) not something honours worthy, just something assignment worthy that can put into github + cv
 #   [MEDIUM] Limit the maximum output per lane - see if the model can figure out that overflowing the output lane and clogging up the intersection is a bad idea
