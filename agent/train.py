@@ -17,26 +17,26 @@ from agent.modelGNN import TrafficGNN
 
 SUMO_CFG = "environment/sim.sumocfg"
 NET_FILE = "environment/basic_intersection.net.xml"
-SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"]
-SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings"]
+SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings", "--ignore-route-errors"]
+SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings", "--ignore-route-errors"]
 
 BATCH_SIZE = 64
 GAMMA = 0.9
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 0.96
+EPS_DECAY = 0.97
 MEMORY_SIZE = 50000
-REWARD_MODIFIER = 0.1
-INITIAL_TAU = 0.01
-FINAL_TAU = 0.004
+REWARD_MODIFIER = 0.2
+INITIAL_TAU = 0.015
+FINAL_TAU = 0.001
 
 EPISODE_LENGTH = 500
 EPISODE_NUMBER = 200
 EPISODE_PRINT_FREQUENCY = 5
-CAR_SPAWN_FREQUENCY = 4
 
 DECISION_FREQUENCY = 25
-YELLOW_TIME = 5
+YELLOW_TIME = 8
+WAIT_TIME = 6 #Time from lights going red for other to go green
 CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
@@ -190,9 +190,9 @@ class SumoIntersectionEnv:
 
     def get_reward(self):
 
-        total_wait_sq_penalty = sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*0.00002
-        reward = self.throughput_this_step - len(self.active_vehicles)*0.15 - total_wait_sq_penalty
-        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {-len(self.active_vehicles)*0.15:.2f} |  Waiting Penalty Total: {-total_wait_sq_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * REWARD_MODIFIER:.3f}")
+        total_wait_sq_penalty = sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*0.00006
+        reward = self.throughput_this_step - len(self.active_vehicles)*0.2 - total_wait_sq_penalty
+        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {-len(self.active_vehicles)*0.2:.2f} |  Waiting Penalty Total: {-total_wait_sq_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * REWARD_MODIFIER:.3f}")
         return reward * REWARD_MODIFIER
 
 def aggregate_print_metrics(ep_metrics):
@@ -238,7 +238,8 @@ def train_agent():
     epsilon = EPS_START
     training_history = []
     
-    print(f"Starting Training on {DEVICE}... Max Reward value for these settings = {((EPISODE_LENGTH / CAR_SPAWN_FREQUENCY) * REWARD_MODIFIER):.1f}")
+    
+    print(f"Starting Training on {DEVICE}. Tentative Maximum Reward: {(EPISODE_LENGTH*REWARD_MODIFIER)/4}")
     for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
         ep_metrics = {
             "reward": 0,
@@ -258,7 +259,9 @@ def train_agent():
         for episode in range(0, EPISODE_PRINT_FREQUENCY):
 
             seed = random.randint(0, 1000000)
-            generate_routes(seed, EPISODE_LENGTH, CAR_SPAWN_FREQUENCY)
+            frequency = max(2, min(8, random.gauss(4.75, 2.25)))
+            generate_routes(seed, EPISODE_LENGTH, frequency)
+            #print(f"{frequency:.2f}")
 
             state = env.reset()
 
@@ -270,13 +273,12 @@ def train_agent():
                 if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*10:
                     break
                 current_sim_time = traci.simulation.getTime()
-
                 action_idx = agent.select_action(state, current_phase, epsilon)
                 next_state, reward, info = env.step(action_idx)
                 next_phase = env.get_phase_vector() #Get next phase based upon this action
                 memory.push(state, action_idx, reward, next_state, current_phase, next_phase, False if done is None else True)
                 metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
-                agent.update_target_network(tau=max(FINAL_TAU, INITIAL_TAU * (epsilon ** 0.2))) #Update the target network slightly
+                agent.update_target_network(tau=max(FINAL_TAU, INITIAL_TAU * (epsilon ** 0.4))) #Update the target network slightly
                 
                 state = next_state
                 current_phase = next_phase
@@ -290,7 +292,7 @@ def train_agent():
                 ep_metrics["q_mean"].append(metrics["q_mean"])
                 ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
-            ep_metrics["extra_timesteps"] = current_sim_time - EPISODE_LENGTH
+            ep_metrics["extra_timesteps"] += current_sim_time - EPISODE_LENGTH
             ep_metrics["epsilon"].append(epsilon)
             epsilon = max(EPS_END, epsilon * EPS_DECAY)
             agent.scheduler.step()
@@ -304,10 +306,14 @@ def train_agent():
 
     print("Training Complete. Saving Model...")
     torch.save(agent.policy_net.state_dict(), "traffic_gnn_model.pth")
-    plot_training_results(training_history)
+    return training_history
 
 def watch_agent():
     # 1. Re-generate the context needed for the model
+    seed = random.randint(0, 1000000)
+    frequency = max(2, min(8, random.gauss(4.75, 2.25)))
+    generate_routes(seed, EPISODE_LENGTH*10, frequency)
+
     nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
     internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
     internal_nodes = [nodes[i] for i in internal_indices]
@@ -321,8 +327,6 @@ def watch_agent():
 
     print("Starting GUI Evaluation...")
 
-    seed = random.randint(0, 1000000)
-    generate_routes(seed, EPISODE_LENGTH*10, CAR_SPAWN_FREQUENCY)
     
     state = env.reset()
     done = False
@@ -339,7 +343,7 @@ def watch_agent():
         
         # Check if simulation time is up and intersection is clear
         current_sim_time = traci.simulation.getTime()
-        if current_sim_time >= EPISODE_LENGTH and traci.simulation.getMinExpectedNumber() == 0:
+        if current_sim_time >= EPISODE_LENGTH*10 and traci.simulation.getMinExpectedNumber() == 0:
             done = True
             
     print(f"Evaluation Run Complete.")
@@ -348,48 +352,54 @@ def watch_agent():
 def plot_training_results(history):
     episodes = [h["episode"] for h in history]
     
-    # Extract data
     mean_rewards = [h["reward"] / EPISODE_PRINT_FREQUENCY for h in history]
     avg_q_values = [np.mean(h["q_mean"]) for h in history]
     avg_losses = [np.mean(h["loss"]) if h["loss"] else 0 for h in history]
-    avg_queues = [np.mean(h["queue_len"]) for h in history]
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle('Traffic GNN Training Metrics')
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    fig.suptitle('Combined Traffic GNN Training Metrics')
 
-    # Mean Reward
-    axs[0, 0].plot(episodes, mean_rewards, color='green')
-    axs[0, 0].set_title('Mean Reward')
-    axs[0, 0].grid(True)
+    # 1. Reward (Left Axis)
+    ax1.set_xlabel('Episodes')
+    ax1.set_ylabel('Mean Reward', color='green')
+    ax1.plot(episodes, mean_rewards, color='green', label='Mean Reward', linewidth=2)
+    ax1.tick_params(axis='y', labelcolor='green')
+    ax1.grid(True, alpha=0.3)
 
-    # Average Q Value
-    axs[0, 1].plot(episodes, avg_q_values, color='blue')
-    axs[0, 1].set_title('Mean Q-Value')
-    axs[0, 1].grid(True)
+    # 2. Q-Value (Right Axis)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Mean Q-Value', color='blue')
+    ax2.plot(episodes, avg_q_values, color='blue', label='Mean Q-Value', linestyle='--')
+    ax2.tick_params(axis='y', labelcolor='blue')
 
-    # Loss
-    axs[1, 0].plot(episodes, avg_losses, color='red')
-    axs[1, 0].set_title('Average Loss')
-    axs[1, 0].grid(True)
+    # 3. Loss (Offset Right Axis)
+    ax3 = ax1.twinx()
+    # Offset the third axis so it doesn't sit on top of the Q-value axis
+    ax3.spines['right'].set_position(('outward', 60))
+    ax3.set_ylabel('Average Loss', color='red')
+    ax3.plot(episodes, avg_losses, color='red', label='Average Loss', alpha=0.6)
+    ax3.tick_params(axis='y', labelcolor='red')
 
-    # Queue Length
-    axs[1, 1].plot(episodes, avg_queues, color='orange')
-    axs[1, 1].set_title('Average Queue Length')
-    axs[1, 1].grid(True)
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc='upper left')
 
     plt.tight_layout()
-    plt.savefig("training_metrics.png")
+    plt.savefig("combined_metrics.png")
     plt.show()
 
 if __name__ == "__main__":
-    #train_agent()
+    history = train_agent()
+    plot_training_results(history)
     watch_agent()
 
 #TODO:
-#   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted
-#   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency)
+#   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted [DONE]
+#   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency) [DONE]
 #           - Allow the Agent to "See" Current lights and make decisions around that [DONE]
 #           - Increase the Training Frequency [DONE]
-#           - Increase Vehicle Randomness / Reduce Traffic light changing efficiency
+#           - Increase Vehicle Randomness / Reduce Traffic light changing efficiency [DONE]
 #   [HIGH] Write a detailed Report (should aim for 6-10 pages) not something honours worthy, just something assignment worthy that can put into github + cv
 #   [MEDIUM] Limit the maximum output per lane - see if the model can figure out that overflowing the output lane and clogging up the intersection is a bad idea
