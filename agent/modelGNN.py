@@ -30,15 +30,26 @@ class TrafficGNN(nn.Module):
             nn.ReLU()
         )
         #Second Phase: Flow and Conflict Convolutional layers that allow lanes to talk to each other smartly
-        self.flow_conv = nn.Linear(64, 64)
-        self.conflict_conv = nn.Linear(64, 64)
-        self.update_gate = nn.Linear(64*3, 64)
-        self.ln1 = nn.LayerNorm(64*3)
+        self.flow_conv = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+        self.conflict_conv = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+        
+        #Third Phase: Compress these matmul'd matrices into a better format. Layer Normalisation just in case
+        self.feature_compressor = nn.Sequential(
+            nn.LayerNorm(64*3),
+            nn.Linear(64*3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8),
+            nn.ReLU()
+        )
 
-        #Third Phase: Outputs a single Priority value per lane
-        self.feature_compressor = nn.Linear(64, 8)
-
-        self.lane_scoring = nn.Sequential(
+        #Fourth Phase: Outputs a single Priority value per internal lane
+        self.internal_scoring = nn.Sequential(
             nn.Linear(num_lanes * 8 + output_dim, 64), #Flat layer + concat the current phase at the end
             nn.ReLU(),
             nn.Linear(64, output_dim)
@@ -53,27 +64,26 @@ class TrafficGNN(nn.Module):
         """
 
         batch_size, num_lanes, seq_len, feats = x.shape                                                                                #[64, 26, 50, 3]
-
         x_cnn = x.view(-1, seq_len, feats).permute(0, 2, 1) #Join Batch + Lane for Lane encoding, faster. Switch for maxpool1d         #[1164, 3, 50]
 
-        features = self.lane_encoder(x_cnn)                                                                                            #[1164, 16, 12]
-        lane_embeddings = torch.mean(features, dim=2)                                                                                  #[1164, 32]
-        lane_embeddings = lane_embeddings.view(batch_size, num_lanes, -1)                                                              #[64, 26, 32]
+        #Phase 1
+        features = self.lane_encoder(x_cnn)                                                                                            #[1164, 64, 12]
+        lane_embeddings = torch.mean(features, dim=2)                                                                                  #[1164, 64]
+        lane_embeddings = lane_embeddings.view(batch_size, num_lanes, -1)                                                              #[64, 26, 64]
 
+        #Phase 2
         m_flow = torch.matmul(adj_flow, lane_embeddings) # Matrix multiply by both flow and conflict matrix to get each individually
         m_conflict = torch.matmul(adj_conf, lane_embeddings)
+        m_flow = self.flow_conv(m_flow) #After Matmul, we run through a linear layer                                                    [64, 26, 64]
+        m_conflict = self.conflict_conv(m_conflict)                                                                                    #[64, 26, 64]
         
-        m_flow = F.relu(self.flow_conv(m_flow)) #Activation function & through weights                                                  [64, 26, 32]
-        m_conflict = F.relu(self.conflict_conv(m_conflict))                                                                            #[64, 26, 32]
-        
-        context_embeddings = torch.cat([lane_embeddings, m_flow, m_conflict], dim=2) #Combine the lane embeddings and the matrix mult   [64, 26, 96]
-        context_embeddings = self.ln1(context_embeddings)
-        context_embeddings = F.relu(self.update_gate(context_embeddings)) #Activation function this                                     [64, 26, 32]
-        
-        compressed = F.relu(self.feature_compressor(context_embeddings)) #Compress to size 8                                            [64, 26, 8]
-        flat_intersection = compressed.view(batch_size, -1)                                                                            #[64, 208]
-        combined_state = torch.cat([flat_intersection, current_phase_vectors], dim=1) #Concatonate the current phase to the end of this [64, 222]
-        lane_q_values = self.lane_scoring(combined_state) #Dense layer to bring down into scoreable lanes                              #[64, 14]
+        #Phase 3
+        context_embeddings = torch.cat([lane_embeddings, m_flow, m_conflict], dim=2) #Combine the lane embeddings and the matrix mult   [64, 26, 192]
+        compressed = self.feature_compressor(context_embeddings) #Compress to size 8                                                    [64, 26, 8]
+
+        #Phase 4
+        combined_state = torch.cat([compressed.view(batch_size, -1), current_phase_vectors], dim=1) #Concatonate the current phase to the end of this [64, 222]
+        lane_q_values = self.internal_scoring(combined_state) #Dense layer to bring down into scoreable lanes                           [64, 14]
         
         return lane_q_values.squeeze(-1)
         

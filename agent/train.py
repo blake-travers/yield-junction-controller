@@ -2,16 +2,14 @@ import os
 import torch
 import numpy as np
 import traci
-import sumolib
 import time
 import random
-import contextlib
 import matplotlib.pyplot as plt
 
 from agent.agent import DoubleDQNAgent, PrioritisedReplayBuffer
-from agent.vehicle import Vehicle
 from agent.adjacency_matrix import get_adjacency_matrices
 from agent.generate_phases import generate_rule_based_phases, create_phase_mask
+from agent.environment_wrapper import SumoIntersectionEnv
 from environment.generate_routes import generate_routes
 from agent.modelGNN import TrafficGNN
 
@@ -24,7 +22,7 @@ BATCH_SIZE = 64
 GAMMA = 0.9
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 0.97
+EPS_DECAY = 0.96
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.2
 INITIAL_TAU = 0.015
@@ -36,7 +34,6 @@ EPISODE_PRINT_FREQUENCY = 5
 
 DECISION_FREQUENCY = 25
 YELLOW_TIME = 8
-WAIT_TIME = 6 #Time from lights going red for other to go green
 CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
@@ -45,155 +42,6 @@ SCOREABLE_LANES = 14
 NUM_LANES = 26
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class SumoIntersectionEnv:
-    """
-    Enviroment Wrapper representing the SUMO environment and the connection between it and the trainable agent
-    """
-    def __init__(self, net_file, sumo_cmd, phases, lane_list):
-        self.net_file = net_file
-        self.sumo_cmd = sumo_cmd
-        self.phases = phases
-        self.lane_list = lane_list
-        self.active_vehicles = {}
-        self.tls_id = None
-        
-    def reset(self):
-        try: traci.close()
-        except: pass
-
-
-        with open(os.devnull, 'w') as fnull:
-            with contextlib.redirect_stderr(fnull), contextlib.redirect_stdout(fnull):
-                traci.start(self.sumo_cmd)
-                
-        self.tls_id = traci.trafficlight.getIDList()[0]
-
-        self.internal_lane_ids = [lane for lane in self.lane_list if ":" in lane] #Grab the Internal lanes
-        controlled_links = traci.trafficlight.getControlledLinks(self.tls_id) #Grab the traci-linked lights
-        self.lane_to_str_idx = {}
-
-        for string_idx, links in enumerate(controlled_links): #For each controlled link
-            for link in links:
-                lane_id = link[0] #Get the id
-                if lane_id in self.internal_lane_ids: #Map the id to the internal lane
-                    self.lane_to_str_idx[lane_id] = string_idx
-
-
-        self.active_vehicles = {}
-
-        self.start_sim_time = traci.simulation.getTime()
-        
-        for _ in range(10):
-            self._sim_step()
-            
-        return self.get_state()
-
-    def step(self, action_idx):
-        target_phase = self.phases[action_idx]
-        current_phase = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-        
-        self.throughput_this_step = 0
-        
-        if target_phase != current_phase: #If changing phases
-            y_state = list(current_phase)
-            for i in range(len(current_phase)):
-                if current_phase[i].lower() == 'g' and target_phase[i].lower() == 'r':
-                    y_state[i] = 'y'
-            
-            traci.trafficlight.setRedYellowGreenState(self.tls_id, "".join(y_state))
-            
-            for _ in range(YELLOW_TIME): #For YELLOW TIME
-                self.throughput_this_step += self._sim_step()
-            
-            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase) #Now switch all target g to green, and target r to red
-
-            for _ in range(max(0, DECISION_FREQUENCY - YELLOW_TIME)): #For the rest of the duration we step the environment
-                self.throughput_this_step += self._sim_step()
-            
-        else: #If staying the same, run the same for another 50 timesteps
-            traci.trafficlight.setRedYellowGreenState(self.tls_id, target_phase)
-            for _ in range(DECISION_FREQUENCY):
-                self.throughput_this_step += self._sim_step()
-            
-        next_state = self.get_state()
-        reward = self.get_reward()
-
-        current_queue_len = len(self.active_vehicles)
-        total_system_wait = sum([v.wait_time for v in self.active_vehicles.values()])
-        avg_system_wait = total_system_wait / current_queue_len if current_queue_len > 0 else 0.0
-
-        info = {
-            "queue_len": current_queue_len,
-            "avg_wait": avg_system_wait,
-            "throughput": self.throughput_this_step
-        }
-        
-        return next_state, reward, info
-
-    def _sim_step(self):
-        traci.simulationStep()
-        current_ids = set(traci.vehicle.getIDList())
-        
-        for vid in current_ids: #For each vehicle
-            if vid not in self.active_vehicles: #If a new vehicle
-                self.active_vehicles[vid] = Vehicle(vid) #Create a new class
-            self.active_vehicles[vid].update() #Update all vehicles including this one
-            
-        departed = set(self.active_vehicles.keys()) - current_ids #Get list of done vehicles
-        departed_count = len(departed)
-        for vid in departed:
-            del self.active_vehicles[vid] #Delete this done vehicles
-
-        return departed_count #Return for reward
-
-    def get_state(self):
-        """
-        Builds the Discretized Lane Grid.
-        Shape: [1, Num_Lanes, 48]
-        """
-        batch_features = []
-
-        for lane_id in self.lane_list:
-            lane_grid = np.zeros((NUM_CELLS, FEATURES), dtype=np.float32) #Initialise lane grid of size at the moment 50x3
-            
-            lane_cars = [v for v in self.active_vehicles.values() if v.getLaneID() == lane_id] #Get all vehicles in this current lane
-            
-            for car in lane_cars: #For each car in this lane
-                position = car.getPosition() #Get the position of this car along the edge
-                cell_idx = int(position / CELL_LENGTH) #Get the closest index to this car position
-                dir_vec = car.getDirection() #Get the direction of this car
-                lane_grid[cell_idx] = dir_vec #Populate the index with this direction vector
-            
-            batch_features.append(lane_grid) #Flatten for MLP
-
-        return torch.tensor(np.array([batch_features]), dtype=torch.float32).to(DEVICE)
-    
-    def get_phase_vector(self):
-        """
-        Returns a [1, 14] tensor representing the current Green/Red status 
-        of the 14 internal lanes.
-        """
-        phase_str = traci.trafficlight.getRedYellowGreenState(self.tls_id) #Get the current phase string
-        
-        phase_vec = []
-        for lane_id in self.internal_lane_ids: #For each internal lane id
-            idx = self.lane_to_str_idx.get(lane_id) #Get the mapping
-            if idx is not None and idx < len(phase_str):
-                is_green = 1.0 if phase_str[idx].lower() == 'g' else 0.0  #If green population index with 1, else 0
-            else:
-                is_green = 0.0
-
-            phase_vec.append(is_green)
-
-        return torch.tensor([phase_vec], dtype=torch.float32).to(DEVICE)
-
-    def get_reward(self):
-
-        total_wait_sq_penalty = sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*0.00006
-        reward = self.throughput_this_step - len(self.active_vehicles)*0.2 - total_wait_sq_penalty
-        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {-len(self.active_vehicles)*0.2:.2f} |  Waiting Penalty Total: {-total_wait_sq_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * REWARD_MODIFIER:.3f}")
-        return reward * REWARD_MODIFIER
 
 def aggregate_print_metrics(ep_metrics):
     avg_loss = np.mean(ep_metrics["loss"]) if ep_metrics["loss"] else 0.0
@@ -230,7 +78,7 @@ def train_agent():
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes)
     
     print("Setting up Intersection Environment...")
-    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
     
     agent = DoubleDQNAgent(num_lanes=NUM_LANES, scoreable_lanes=SCOREABLE_LANES, num_phases=len(phases), input_dim=FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
@@ -319,7 +167,7 @@ def watch_agent():
     internal_nodes = [nodes[i] for i in internal_indices]
     phases = generate_rule_based_phases(NET_FILE)
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
-    env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD, phases, nodes)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
 
     model = TrafficGNN(input_dim=FEATURES, output_dim=SCOREABLE_LANES, num_lanes=NUM_LANES).to(DEVICE)
     model.load_state_dict(torch.load("traffic_gnn_model.pth"))
@@ -391,15 +239,6 @@ def plot_training_results(history):
     plt.show()
 
 if __name__ == "__main__":
-    history = train_agent()
-    plot_training_results(history)
+    #history = train_agent()
+    #plot_training_results(history)
     watch_agent()
-
-#TODO:
-#   [HIGH] Modify Reward Function: Penalise cars based upon their cumulative waiting time as well as the number of cars active / halted [DONE]
-#   [HIGH] Allow the agent to have higher fidelity in terms of traffic light control - it can change the lights whenever it wants to, but has an indirect incentive to keep the same (efficiency) [DONE]
-#           - Allow the Agent to "See" Current lights and make decisions around that [DONE]
-#           - Increase the Training Frequency [DONE]
-#           - Increase Vehicle Randomness / Reduce Traffic light changing efficiency [DONE]
-#   [HIGH] Write a detailed Report (should aim for 6-10 pages) not something honours worthy, just something assignment worthy that can put into github + cv
-#   [MEDIUM] Limit the maximum output per lane - see if the model can figure out that overflowing the output lane and clogging up the intersection is a bad idea
