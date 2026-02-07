@@ -5,6 +5,7 @@ import traci
 import time
 import random
 import matplotlib.pyplot as plt
+from tabulate import tabulate
 
 from agent.agent import DoubleDQNAgent, PrioritisedReplayBuffer
 from agent.adjacency_matrix import get_adjacency_matrices
@@ -19,21 +20,22 @@ SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log",
 SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings", "--ignore-route-errors"]
 
 BATCH_SIZE = 64
-GAMMA = 0.9
+GAMMA = 0.95
 EPS_START = 1.0
-EPS_END = 0.05
-EPS_DECAY = 0.96
+EPS_END = 0.02
+EPS_DECAY = 0.83
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.2
-INITIAL_TAU = 0.015
+INITIAL_TAU = 0.03
 FINAL_TAU = 0.001
 
 EPISODE_LENGTH = 500
-EPISODE_NUMBER = 200
+EPISODE_NUMBER = 300
 EPISODE_PRINT_FREQUENCY = 5
 
-DECISION_FREQUENCY = 25
-YELLOW_TIME = 8
+DECISION_FREQUENCY = 5
+YELLOW_TIME = 4
+MIN_GREEN = 15 #Minimum amount of time on green light
 CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
@@ -78,7 +80,7 @@ def train_agent():
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes)
     
     print("Setting up Intersection Environment...")
-    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER, MIN_GREEN)
     
     agent = DoubleDQNAgent(num_lanes=NUM_LANES, scoreable_lanes=SCOREABLE_LANES, num_phases=len(phases), input_dim=FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
@@ -107,7 +109,7 @@ def train_agent():
         for episode in range(0, EPISODE_PRINT_FREQUENCY):
 
             seed = random.randint(0, 1000000)
-            frequency = max(2, min(8, random.gauss(4.75, 2.25)))
+            frequency = max(1, min(5, random.gauss(2.75, 2.25)))
             generate_routes(seed, EPISODE_LENGTH, frequency)
             #print(f"{frequency:.2f}")
 
@@ -118,7 +120,7 @@ def train_agent():
             current_sim_time = 0 #Set to zero for first while
 
             while True: #Go until no more active vehicles. As soon as "done" is true we break
-                if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*10:
+                if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*3:
                     break
                 current_sim_time = traci.simulation.getTime()
                 action_idx = agent.select_action(state, current_phase, epsilon)
@@ -156,47 +158,6 @@ def train_agent():
     torch.save(agent.policy_net.state_dict(), "traffic_gnn_model.pth")
     return training_history
 
-def watch_agent():
-    # 1. Re-generate the context needed for the model
-    seed = random.randint(0, 1000000)
-    frequency = max(2, min(8, random.gauss(4.75, 2.25)))
-    generate_routes(seed, EPISODE_LENGTH*10, frequency)
-
-    nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
-    internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
-    internal_nodes = [nodes[i] for i in internal_indices]
-    phases = generate_rule_based_phases(NET_FILE)
-    phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
-    env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
-
-    model = TrafficGNN(input_dim=FEATURES, output_dim=SCOREABLE_LANES, num_lanes=NUM_LANES).to(DEVICE)
-    model.load_state_dict(torch.load("traffic_gnn_model.pth"))
-    model.eval() 
-
-    print("Starting GUI Evaluation...")
-
-    
-    state = env.reset()
-    done = False
-
-    while not done:
-        with torch.no_grad():
-            # Get lane priorities from the GNN
-            lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE), env.get_phase_vector())
-            
-            phase_q = torch.matmul(lane_q, phase_mask.t()) / SCOREABLE_LANES  #Pick the best phase
-            action_idx = phase_q.argmax(dim=1).item()
-            
-        state, reward, info = env.step(action_idx)
-        
-        # Check if simulation time is up and intersection is clear
-        current_sim_time = traci.simulation.getTime()
-        if current_sim_time >= EPISODE_LENGTH*10 and traci.simulation.getMinExpectedNumber() == 0:
-            done = True
-            
-    print(f"Evaluation Run Complete.")
-    traci.close()
-
 def plot_training_results(history):
     episodes = [h["episode"] for h in history]
     
@@ -214,31 +175,292 @@ def plot_training_results(history):
     ax1.tick_params(axis='y', labelcolor='green')
     ax1.grid(True, alpha=0.3)
 
-    # 2. Q-Value (Right Axis)
+    # 2. Q-Value AND Loss (Shared Right Axis)
     ax2 = ax1.twinx()
-    ax2.set_ylabel('Mean Q-Value', color='blue')
+    ax2.set_ylabel('Mean Q-Value & Loss', color='black') # Label covers both
+    
+    # Plot Q-Values (Blue dashed)
     ax2.plot(episodes, avg_q_values, color='blue', label='Mean Q-Value', linestyle='--')
-    ax2.tick_params(axis='y', labelcolor='blue')
+    
+    # Plot Loss (Red solid) - ON THE SAME AXIS (ax2)
+    ax2.plot(episodes, avg_losses, color='red', label='Average Loss', alpha=0.6)
+    
+    ax2.tick_params(axis='y', labelcolor='black')
 
-    # 3. Loss (Offset Right Axis)
-    ax3 = ax1.twinx()
-    # Offset the third axis so it doesn't sit on top of the Q-value axis
-    ax3.spines['right'].set_position(('outward', 60))
-    ax3.set_ylabel('Average Loss', color='red')
-    ax3.plot(episodes, avg_losses, color='red', label='Average Loss', alpha=0.6)
-    ax3.tick_params(axis='y', labelcolor='red')
-
-    # Combine legends
+    # Combine legends (Only need ax1 and ax2 now)
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    lines3, labels3 = ax3.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc='upper left')
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
     plt.tight_layout()
     plt.savefig("combined_metrics.png")
     plt.show()
 
+def run_gnn_simulation(gui=False, episode_length=EPISODE_LENGTH):
+    """
+    Runs an evaluation example for the trained GNN agent based on the existing routes xml file
+    Returns detailed episode metrics
+    """
+    nodes, adj_flow, adj_conf = get_adjacency_matrices(NET_FILE)
+    internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
+    internal_nodes = [nodes[i] for i in internal_indices]
+
+    phases = generate_rule_based_phases(NET_FILE)
+    phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_GUI_CMD if gui else SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
+
+    model = TrafficGNN(input_dim=FEATURES, output_dim=SCOREABLE_LANES, num_lanes=NUM_LANES).to(DEVICE)
+    model.load_state_dict(torch.load("traffic_gnn_model.pth"))
+    model.eval() 
+
+    print(f"Starting GNN Evaluation. GUI mode: {"On" if gui else "Off"}.")
+
+    state = env.reset()
+    done = False
+    total_reward = 0
+    speeds = []
+    arrived_vehicles = 0
+    queue_lengths = []
+    time_losses = []
+    max_wait_time_observed = 0.0
+    speeds = []
+    track_waits = {}
+
+    while not done:
+        with torch.no_grad():
+            lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE), env.get_phase_vector())
+            phase_q = torch.matmul(lane_q, phase_mask.t()) / SCOREABLE_LANES
+            action_idx = phase_q.argmax(dim=1).item()
+
+        state, reward, info = env.step(action_idx)
+        total_reward += reward
+
+        veh_ids = traci.vehicle.getIDList()
+
+        if len(veh_ids) > 0:
+            queue_lengths.append(sum(1 for vid in veh_ids if traci.vehicle.getSpeed(vid) < 0.1)) #Track Queue Lengths
+            speeds.extend([traci.vehicle.getSpeed(vid) for vid in veh_ids]) #Track Current Speeds
+            time_losses.extend([traci.vehicle.getTimeLoss(vid) for vid in veh_ids]) #Track Time lost
+
+            current_waits = [traci.vehicle.getAccumulatedWaitingTime(vid) for vid in veh_ids] #Track the longest car waiting time and average waiting time
+
+            for i, vid in enumerate(veh_ids):
+                track_waits[vid] = current_waits[i]
+            
+            if current_waits:
+                step_max_wait = max(current_waits)
+                if step_max_wait > max_wait_time_observed:
+                    max_wait_time_observed = step_max_wait
+
+        arrived_vehicles += traci.simulation.getArrivedNumber()
+
+        current_sim_time = traci.simulation.getTime()
+        if current_sim_time >= episode_length: #Terminate regardless of if empty or not
+            done = True
+
+    traci.close()
+
+    avg_speed = (np.mean(speeds) * 3.6) if speeds else 0.0 # Convert m/s to km/h
+    avg_queue = np.mean(queue_lengths) if queue_lengths else 0.0
+    avg_time_loss = np.mean(time_losses) if time_losses else 0.0
+    avg_wait = np.mean(list(track_waits.values())) if track_waits else 0.
+    throughput_rate = (arrived_vehicles / episode_length) * 3600 # Vehicles per hour
+
+    return {
+        "Avg Wait Time (s)": round(avg_wait, 2),
+        "Avg Queue Length (veh)": round(avg_queue, 2),
+        "Avg Speed (km/h)": round(avg_speed, 2),
+        "Avg Time Loss (s)": round(avg_time_loss, 2),
+        "Max Wait Time (s)": round(max_wait_time_observed, 2),
+        "Throughput (veh/hr)": round(throughput_rate, 2),
+        "Total Reward": round(total_reward, 2)
+    }
+
+def run_baseline_simulation(gui=False, episode_length=500):
+    """
+    Heuristic Baseline: "Oracle Lane Scoring"
+    
+    1. Identifies the 14 Internal Lanes (e.g., :J1_0_0) that the Phase Mask controls.
+    2. Counts exactly how many vehicles want to enter each of those 14 lanes.
+    3. Constructs a [1, 14] Score Vector.
+    4. Multiplies by the [14, 848] Phase Mask to find the best Phase.
+    """
+    
+    # 1. SETUP: Generate the exact same Matrices and Masks as the GNN
+    nodes, _, _ = get_adjacency_matrices(NET_FILE) # 'nodes' is length 26
+    
+    # Extract ONLY the 14 Internal Nodes (this matches the Phase Mask dimensions)
+    internal_indices = [i for i, node in enumerate(nodes) if ":" in node]
+    internal_nodes = [nodes[i] for i in internal_indices] # Length 14
+    
+    phases = generate_rule_based_phases(NET_FILE)
+    # The Mask shape is [Num_Phases, Num_Internal_Lanes] -> [848, 14]
+    phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
+    
+    cmd_mode = SUMO_GUI_CMD if gui else SUMO_CMD
+    env = SumoIntersectionEnv(NET_FILE, cmd_mode, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
+    
+    print(f"Starting Heuristic Baseline (Oracle Lane Scoring). GUI: {gui}")
+
+    # Metrics
+    total_reward = 0
+    waiting_times = []       
+    queue_lengths = []
+    time_losses = []
+    speeds = []
+    arrived_vehicles = 0
+    max_wait_time_observed = 0.0
+    track_waits = {} 
+
+    state = env.reset()
+    done = False
+    
+    # --- MAP: Signal Index -> Internal Lane ID ---
+    # We need this to know which internal lane a car is targeting
+    tls_id = traci.trafficlight.getIDList()[0]
+    links = traci.trafficlight.getControlledLinks(tls_id)
+    signal_to_internal = {}
+    for idx, connections in enumerate(links):
+        if len(connections) > 0:
+            # connection = (Incoming, Outgoing, Via)
+            # We map Signal Index -> Via Lane (Internal)
+            signal_to_internal[idx] = connections[0][2]
+
+    while not done:
+        
+        # --- 1. CALCULATE SCORES FOR INTERNAL LANES ---
+        # We need to build a score for each of the 14 internal_nodes
+        internal_lane_counts = {lane: 0 for lane in internal_nodes}
+
+        # [FRESH LIST] Get IDs for Decision Making
+        decision_veh_ids = traci.vehicle.getIDList()
+        
+        for vid in decision_veh_ids:
+            # getNextTLS returns: [(tlsID, tlsIndex, dist, state), ...]
+            next_tls = traci.vehicle.getNextTLS(vid)
+            
+            for tls_info in next_tls:
+                t_id, t_index, t_dist, _ = tls_info
+                if t_id == tls_id:
+                    # Found the target signal index. Map to Internal Lane ID.
+                    if t_index in signal_to_internal:
+                        target_lane = signal_to_internal[t_index]
+                        
+                        # Increment score for this internal lane
+                        if target_lane in internal_lane_counts:
+                            internal_lane_counts[target_lane] += 1
+                    break # Only count the immediate next light
+
+        # --- 2. CONSTRUCT SCORE TENSOR [1, 14] ---
+        # We must iterate internal_nodes to ensure the order matches phase_mask
+        ordered_scores = [internal_lane_counts[lane] for lane in internal_nodes]
+        lane_score_tensor = torch.tensor([ordered_scores], dtype=torch.float32).to(DEVICE)
+        
+        # --- 3. CALCULATE PHASE SCORES ---
+        # [1, 14] @ [14, 848] = [1, 848]
+        # We transpose phase_mask from [848, 14] to [14, 848]
+        phase_scores = torch.matmul(lane_score_tensor, phase_mask.t())
+        
+        # --- 4. SELECT ACTION ---
+        action_idx = phase_scores.argmax(dim=1).item()
+        
+        # --- 5. STEP ENVIRONMENT ---
+        # This advances the simulation by 25 seconds! Old vehicle lists are now stale.
+        next_state, reward, info = env.step(action_idx)
+        total_reward += reward
+        
+        # --- 6. COLLECT METRICS ---
+        # [FIX] Refresh the list of vehicles immediately after the step
+        # This prevents "Vehicle not known" errors for cars that left during the step
+        current_veh_ids = traci.vehicle.getIDList()
+        
+        if len(current_veh_ids) > 0:
+            halting_count = sum(1 for vid in current_veh_ids if traci.vehicle.getSpeed(vid) < 0.1)
+            queue_lengths.append(halting_count)
+
+            current_waits = []
+            for vid in current_veh_ids:
+                w_time = traci.vehicle.getAccumulatedWaitingTime(vid)
+                current_waits.append(w_time)
+                track_waits[vid] = w_time 
+                speeds.append(traci.vehicle.getSpeed(vid))
+                time_losses.append(traci.vehicle.getTimeLoss(vid))
+
+            if current_waits:
+                step_max = max(current_waits)
+                if step_max > max_wait_time_observed:
+                    max_wait_time_observed = step_max
+
+        arrived_vehicles += traci.simulation.getArrivedNumber()
+        
+        if traci.simulation.getTime() >= episode_length:
+            done = True
+            
+    traci.close()
+    
+    # Final Metrics Calculation
+    avg_wait = np.mean(list(track_waits.values())) if track_waits else 0.0
+    avg_speed = (np.mean(speeds) * 3.6) if speeds else 0.0 
+    avg_queue = np.mean(queue_lengths) if queue_lengths else 0.0
+    avg_time_loss = np.mean(time_losses) if time_losses else 0.0
+    throughput_rate = (arrived_vehicles / episode_length) * 3600
+
+    return {
+        "Avg Wait Time (s)": round(avg_wait, 2),
+        "Avg Queue Length (veh)": round(avg_queue, 2),
+        "Avg Speed (km/h)": round(avg_speed, 2),
+        "Avg Time Loss (s)": round(avg_time_loss, 2),
+        "Max Wait Time (s)": round(max_wait_time_observed, 2),
+        "Throughput (veh/hr)": round(throughput_rate, 2),
+        "Total Reward": round(total_reward, 2)
+    }
+
+def watch_agent():
+    """
+    Generates a Route to watch the GNN perform
+    """
+    seed = random.randint(0, 1000000)
+    frequency = 3 #Constant frequency for now... should do multiple different ones for baseline check
+    print(f"Generating routes with freq {frequency:.2f}...")
+    generate_routes(seed, EPISODE_LENGTH*10, frequency) # Long episode for watching
+
+    metrics = run_gnn_simulation(gui=True, episode_length=EPISODE_LENGTH)
+    print(f"Watch Session Metrics: {metrics}")
+
+def compare_agents():
+    """
+    Compares a GNN and Baseline Heuristic implementation, and prints a comparison table for the report
+    """
+    seed = random.randint(0, 1000000)
+    frequency = 3
+    print("Generating standard validation traffic...")
+    generate_routes(seed, EPISODE_LENGTH, frequency)
+
+    gnn_metrics = run_gnn_simulation(gui=False, episode_length=EPISODE_LENGTH)
+    base_metrics = run_baseline_simulation(gui=True, episode_length=EPISODE_LENGTH)
+
+    headers = ["Metric", "Baseline", "TrafficGNN", "Diff"]
+    table_data = []
+
+    for key in gnn_metrics.keys(): #Calculate data
+        base_val = base_metrics.get(key, 0)
+        gnn_val = gnn_metrics.get(key, 0)
+        
+        if base_val != 0:
+            diff = ((gnn_val - base_val) / base_val) * 100
+            diff_str = f"{diff:+.1f}%"
+        else:
+            diff_str = "N/A"
+            
+        table_data.append([key, base_val, gnn_val, diff_str])
+
+    print("\n" + "="*60)
+    print("FINAL COMPARISON RESULTS")
+    print("="*60)
+    print(tabulate(table_data, headers=headers, tablefmt="grid")) #Print table in nice format
+
 if __name__ == "__main__":
     #history = train_agent()
     #plot_training_results(history)
     watch_agent()
+    #compare_agents()

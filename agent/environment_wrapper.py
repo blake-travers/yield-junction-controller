@@ -10,7 +10,7 @@ class SumoIntersectionEnv:
     """
     Enviroment Wrapper representing the SUMO environment and the connection between it and the trainable agent
     """
-    def __init__(self, net_file, sumo_cmd, phases, lane_list, yellow_time, decision_frequency, num_cells, features, cell_length, device, reward_modifier):
+    def __init__(self, net_file, sumo_cmd, phases, lane_list, yellow_time, decision_frequency, num_cells, features, cell_length, device, reward_modifier, min_green):
         self.net_file = net_file
         self.sumo_cmd = sumo_cmd
         self.phases = phases
@@ -25,11 +25,12 @@ class SumoIntersectionEnv:
         self.cell_length = cell_length
         self.device = device
         self.reward_modifier = reward_modifier
+        self.min_green = min_green
+        self.last_switch_time = 0
 
     def reset(self):
         try: traci.close()
         except: pass
-
 
         with open(os.devnull, 'w') as fnull:
             with contextlib.redirect_stderr(fnull), contextlib.redirect_stdout(fnull):
@@ -43,7 +44,7 @@ class SumoIntersectionEnv:
 
         for string_idx, links in enumerate(controlled_links): #For each controlled link
             for link in links:
-                lane_id = link[0] #Get the id
+                lane_id = link[2] #Get the id
                 if lane_id in self.internal_lane_ids: #Map the id to the internal lane
                     self.lane_to_str_idx[lane_id] = string_idx
 
@@ -54,12 +55,18 @@ class SumoIntersectionEnv:
         
         for _ in range(10):
             self._sim_step()
-            
+
+        self.last_switch_time = 0    
         return self.get_state()
 
     def step(self, action_idx):
         target_phase = self.phases[action_idx]
         current_phase = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+        current_sim_time = traci.simulation.getTime()
+        time_since_change = current_sim_time - self.last_switch_time
+
+        #if target_phase != current_phase and time_since_change < self.min_green:
+
         
         self.throughput_this_step = 0
         
@@ -158,8 +165,11 @@ class SumoIntersectionEnv:
 
     def get_reward(self):
 
-        total_wait_penalty = - sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*0.0001
-        active_vehicle_penalty = - len(self.active_vehicles)*0.15
+        WAIT_COEFFICIENT = 0.00001 * 4 * self.decision_frequency #Normalised depending on frequency
+        ACTIVE_COEFFICIENT = 0.01 * 1 * self.decision_frequency
+        
+        total_wait_penalty = max(-sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*WAIT_COEFFICIENT, -2.5) #With reward modifier of 0.2, this basically means -0.5 min and for 100 decisions thats -50
+        active_vehicle_penalty = -len(self.active_vehicles)*ACTIVE_COEFFICIENT
         reward = self.throughput_this_step + active_vehicle_penalty +  total_wait_penalty
-        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {active_vehicle_penalty:.2f} |  Waiting Penalty Total: {total_wait_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * REWARD_MODIFIER:.3f}")
-        return max(min(reward * self.reward_modifier, 5), -1)
+        #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {active_vehicle_penalty:.2f} |  Waiting Penalty Total: {total_wait_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * self.reward_modifier:.3f}")
+        return reward * self.reward_modifier

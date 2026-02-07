@@ -86,8 +86,8 @@ class DoubleDQNAgent:
 
         self.scheduler = optim.lr_scheduler.MultiStepLR( #Scheduler to reduce by 3 times twice
             self.optimizer, 
-            milestones=[20, 50], 
-            gamma=0.3
+            milestones=[25, 50, 100], 
+            gamma=0.25
         )
 
         self.loss_fn = nn.SmoothL1Loss()
