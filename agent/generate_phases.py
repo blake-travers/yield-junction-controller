@@ -123,10 +123,14 @@ def generate_rule_based_phases(net_path):
                     elif idx1 in STRAIGHTS and idx2 in LEFT_TURNS:
                         pass 
                     
-                    elif (idx1 in RIGHT_TURNS and idx2 in STRAIGHTS) or \
-                         (idx1 in STRAIGHTS and idx2 in RIGHT_TURNS):
+                    elif (idx1 in RIGHT_TURNS and idx2 in STRAIGHTS) or (idx1 in STRAIGHTS and idx2 in RIGHT_TURNS):
                         is_safe = False
                         break
+
+                    elif idx1 in LEFT_TURNS and idx2 in RIGHT_TURNS: #If there is a merge between left and right turns
+                        must_yield.add(idx1) #Left must yield to right. If right must yield based on a different condition, it is also g, which means that right will correctly yield to left under these circumastances anyways
+                    elif idx1 in RIGHT_TURNS and idx2 in LEFT_TURNS:
+                        pass
                         
                     else:
                         is_safe = False

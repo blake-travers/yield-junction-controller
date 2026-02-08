@@ -20,22 +20,20 @@ SUMO_CMD = ["sumo", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log",
 SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-step-log", "--no-warnings", "--ignore-route-errors"]
 
 BATCH_SIZE = 64
-GAMMA = 0.95
-EPS_START = 1.0
-EPS_END = 0.02
-EPS_DECAY = 0.83
+GAMMA = 0.9
+TEMP_START = 100
+TEMP_END = 1
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.2
-INITIAL_TAU = 0.03
+INITIAL_TAU = 0.05
 FINAL_TAU = 0.001
 
 EPISODE_LENGTH = 500
-EPISODE_NUMBER = 300
-EPISODE_PRINT_FREQUENCY = 5
+EPISODE_NUMBER = 200
+EPISODE_PRINT_FREQUENCY = 1
 
-DECISION_FREQUENCY = 5
+DECISION_FREQUENCY = 15 #Also represents minimum green time
 YELLOW_TIME = 4
-MIN_GREEN = 15 #Minimum amount of time on green light
 CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
 NUM_CELLS = int(MAX_LANE_SIZE // CELL_LENGTH)
@@ -53,13 +51,13 @@ def aggregate_print_metrics(ep_metrics):
     avg_flush = ep_metrics["extra_timesteps"] / EPISODE_PRINT_FREQUENCY
     avg_td = np.mean(ep_metrics["td_error"]) if ep_metrics["td_error"] else 0
     avg_q = np.mean(ep_metrics["q_mean"]) if ep_metrics["q_mean"] else 0
-    epsilon_mean = np.mean(ep_metrics["epsilon"]) if ep_metrics["epsilon"] else 0
+    temperature_mean = np.mean(ep_metrics["temperature"]) if ep_metrics["temperature"] else 0
 
     print("-" * 120)
     print(f"{f'Episodes: {(ep_metrics["episode"]+1-EPISODE_PRINT_FREQUENCY):03d}-{ep_metrics["episode"]:03d}':<{26}} |")
 
     print(f"{f'  Duration: {ep_metrics["duration"]:8.1f}s':<{26}} | "
-        f"{f'Epsilon Mean: {epsilon_mean:7.3f}':<{21}} | "
+        f"{f'Temp Mean: {temperature_mean:7.1f}':<{21}} | "
         f"{f'Reward Mean: {reward:3.3f}':<{21}} | "
         f"{f'Average Loss: {avg_loss:9.4f}'}")
 
@@ -80,14 +78,16 @@ def train_agent():
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes)
     
     print("Setting up Intersection Environment...")
-    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER, MIN_GREEN)
+    env = SumoIntersectionEnv(NET_FILE, SUMO_CMD, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
     
     agent = DoubleDQNAgent(num_lanes=NUM_LANES, scoreable_lanes=SCOREABLE_LANES, num_phases=len(phases), input_dim=FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
     
-    epsilon = EPS_START
+    temperature = TEMP_START
+    tau = INITIAL_TAU
     training_history = []
-    
+
+    temp_step = (TEMP_START - TEMP_END) / (EPISODE_NUMBER*0.7) #Step size for linear temperature decay for most of training
     
     print(f"Starting Training on {DEVICE}. Tentative Maximum Reward: {(EPISODE_LENGTH*REWARD_MODIFIER)/4}")
     for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
@@ -100,7 +100,7 @@ def train_agent():
             "q_mean": [],
             "throughput": 0,
             "action_counts": {},
-            "epsilon": [],
+            "temperature": [],
             "episode": 0,
             "episode_start": 0,
             "extra_timesteps": 0
@@ -109,7 +109,7 @@ def train_agent():
         for episode in range(0, EPISODE_PRINT_FREQUENCY):
 
             seed = random.randint(0, 1000000)
-            frequency = max(1, min(5, random.gauss(2.75, 2.25)))
+            frequency = random.uniform(1.0, 3.0)
             generate_routes(seed, EPISODE_LENGTH, frequency)
             #print(f"{frequency:.2f}")
 
@@ -123,12 +123,14 @@ def train_agent():
                 if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*3:
                     break
                 current_sim_time = traci.simulation.getTime()
-                action_idx = agent.select_action(state, current_phase, epsilon)
+                action_idx = agent.select_action(state, current_phase, temperature)
                 next_state, reward, info = env.step(action_idx)
                 next_phase = env.get_phase_vector() #Get next phase based upon this action
                 memory.push(state, action_idx, reward, next_state, current_phase, next_phase, False if done is None else True)
                 metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
-                agent.update_target_network(tau=max(FINAL_TAU, INITIAL_TAU * (epsilon ** 0.4))) #Update the target network slightly
+                agent.update_target_network(tau) #Update the target network slightly
+
+                tau = FINAL_TAU + (INITIAL_TAU - FINAL_TAU) * (temperature / TEMP_START) #Update tau value independently of temperature (because / temp start)
                 
                 state = next_state
                 current_phase = next_phase
@@ -143,8 +145,8 @@ def train_agent():
                 ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
             ep_metrics["extra_timesteps"] += current_sim_time - EPISODE_LENGTH
-            ep_metrics["epsilon"].append(epsilon)
-            epsilon = max(EPS_END, epsilon * EPS_DECAY)
+            ep_metrics["temperature"].append(temperature)
+            temperature = max(TEMP_END, temperature - temp_step)
             agent.scheduler.step()
 
         ep_metrics["episode"] = print_episode*EPISODE_PRINT_FREQUENCY
@@ -230,7 +232,7 @@ def run_gnn_simulation(gui=False, episode_length=EPISODE_LENGTH):
         with torch.no_grad():
             lane_q = model(state, adj_flow.to(DEVICE), adj_conf.to(DEVICE), env.get_phase_vector())
             phase_q = torch.matmul(lane_q, phase_mask.t()) / SCOREABLE_LANES
-            action_idx = phase_q.argmax(dim=1).item()
+            action_idx = phase_q.argmax(dim=1).item() #Manually choose instead of going through select action as we do not want temperature / epsilon
 
         state, reward, info = env.step(action_idx)
         total_reward += reward
@@ -298,7 +300,7 @@ def run_baseline_simulation(gui=False, episode_length=500):
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
     
     cmd_mode = SUMO_GUI_CMD if gui else SUMO_CMD
-    env = SumoIntersectionEnv(NET_FILE, cmd_mode, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
+    env = SumoIntersectionEnv(NET_FILE, cmd_mode, phases, nodes, YELLOW_TIME, 25, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
     
     print(f"Starting Heuristic Baseline (Oracle Lane Scoring). GUI: {gui}")
 
@@ -420,7 +422,7 @@ def watch_agent():
     Generates a Route to watch the GNN perform
     """
     seed = random.randint(0, 1000000)
-    frequency = 3 #Constant frequency for now... should do multiple different ones for baseline check
+    frequency = 1.5 #Constant frequency for now... should do multiple different ones for baseline check
     print(f"Generating routes with freq {frequency:.2f}...")
     generate_routes(seed, EPISODE_LENGTH*10, frequency) # Long episode for watching
 
@@ -432,7 +434,7 @@ def compare_agents():
     Compares a GNN and Baseline Heuristic implementation, and prints a comparison table for the report
     """
     seed = random.randint(0, 1000000)
-    frequency = 3
+    frequency = 1.5
     print("Generating standard validation traffic...")
     generate_routes(seed, EPISODE_LENGTH, frequency)
 
@@ -460,7 +462,7 @@ def compare_agents():
     print(tabulate(table_data, headers=headers, tablefmt="grid")) #Print table in nice format
 
 if __name__ == "__main__":
-    #history = train_agent()
-    #plot_training_results(history)
+    history = train_agent()
+    plot_training_results(history)
     watch_agent()
     #compare_agents()
