@@ -159,10 +159,10 @@ class SumoIntersectionEnv:
     def get_reward(self):
 
         WAIT_COEFFICIENT = 0.00001 * 2 * self.decision_frequency #Normalised depending on frequency
-        ACTIVE_COEFFICIENT = 0.001 * 9 * self.decision_frequency
+        ACTIVE_COEFFICIENT = 0.001 * 13 * self.decision_frequency
         
-        total_wait_penalty = max(-sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*WAIT_COEFFICIENT, -2.5) #With reward modifier of 0.2, this basically means -0.5 min and for 100 decisions thats -50
+        total_wait_penalty = -sum(traci.vehicle.getAccumulatedWaitingTime(vid)**1.5 for vid in self.active_vehicles)*WAIT_COEFFICIENT #With reward modifier of 0.2, this basically means -0.5 min and for 100 decisions thats -50
         active_vehicle_penalty = -len(self.active_vehicles)*ACTIVE_COEFFICIENT
-        reward = self.throughput_this_step + active_vehicle_penalty +  total_wait_penalty
+        reward = self.throughput_this_step + active_vehicle_penalty# +  total_wait_penalty
         #print(f"Throughput Reward: {self.throughput_this_step:.0f} |  Active Vehicles Penalty: {active_vehicle_penalty:.2f} |  Waiting Penalty Total: {total_wait_penalty:.2f} |  Total Unmodified Reward: {reward:.2f} |  Total Modified Reward: {reward * self.reward_modifier:.3f}")
         return reward * self.reward_modifier

@@ -99,21 +99,20 @@ class DoubleDQNAgent:
         phase_q_values = torch.matmul(lane_q_values, self.phase_mask.t()) / num_scored_lanes
         return phase_q_values
 
-    def select_action(self, state, phase, temperature):
+    def select_action(self, state, phase, epsilon):
         """
         Select an phase based upon the current state and the policy net
         """
+        if random.random() < epsilon:
+            return random.randint(0, self.num_phases - 1)
+        
         with torch.no_grad():
             state = state.to(self.device)
             phase = phase.to(self.device)
 
-            lane_q = self.policy_net(state, self.adj_flow, self.adj_conf, phase) #Get raw lane scores
+            lane_q = self.policy_net(state, self.adj_flow, self.adj_conf, phase)
             phase_q = self._get_phase_q_values(lane_q)
-
-            scaled_q = phase_q / temperature
-            probs = F.softmax(scaled_q, dim=1) #Softmax probabilities
-
-            return torch.multinomial(probs, num_samples=1) #Return a sample from this distribution
+            return phase_q.argmax(dim=1).item()
 
     def train_step(self, buffer, batch_size, gamma, beta):
 

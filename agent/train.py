@@ -21,18 +21,19 @@ SUMO_GUI_CMD = ["sumo-gui", "-c", SUMO_CFG, "--time-to-teleport", "-1", "--no-st
 
 BATCH_SIZE = 64
 GAMMA = 0.9
-TEMP_START = 100
-TEMP_END = 1
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 0.97
 MEMORY_SIZE = 50000
 REWARD_MODIFIER = 0.2
-INITIAL_TAU = 0.05
+INITIAL_TAU = 0.03
 FINAL_TAU = 0.001
 
 EPISODE_LENGTH = 500
-EPISODE_NUMBER = 200
+EPISODE_NUMBER = 300
 EPISODE_PRINT_FREQUENCY = 1
 
-DECISION_FREQUENCY = 15 #Also represents minimum green time
+DECISION_FREQUENCY = 25
 YELLOW_TIME = 4
 CELL_LENGTH = 1 #In Metres (basic intersection is of size 42 so cell size of 1 means 42 cells)
 MAX_LANE_SIZE = 50
@@ -51,13 +52,13 @@ def aggregate_print_metrics(ep_metrics):
     avg_flush = ep_metrics["extra_timesteps"] / EPISODE_PRINT_FREQUENCY
     avg_td = np.mean(ep_metrics["td_error"]) if ep_metrics["td_error"] else 0
     avg_q = np.mean(ep_metrics["q_mean"]) if ep_metrics["q_mean"] else 0
-    temperature_mean = np.mean(ep_metrics["temperature"]) if ep_metrics["temperature"] else 0
+    epsilon_mean = np.mean(ep_metrics["epsilon"]) if ep_metrics["epsilon"] else 0
 
     print("-" * 120)
     print(f"{f'Episodes: {(ep_metrics["episode"]+1-EPISODE_PRINT_FREQUENCY):03d}-{ep_metrics["episode"]:03d}':<{26}} |")
 
     print(f"{f'  Duration: {ep_metrics["duration"]:8.1f}s':<{26}} | "
-        f"{f'Temp Mean: {temperature_mean:7.1f}':<{21}} | "
+        f"{f'Epsilon Mean: {epsilon_mean:7.3f}':<{21}} | "
         f"{f'Reward Mean: {reward:3.3f}':<{21}} | "
         f"{f'Average Loss: {avg_loss:9.4f}'}")
 
@@ -83,11 +84,9 @@ def train_agent():
     agent = DoubleDQNAgent(num_lanes=NUM_LANES, scoreable_lanes=SCOREABLE_LANES, num_phases=len(phases), input_dim=FEATURES, adj_flow=adj_flow, adj_conf=adj_conf, phase_mask=phase_mask, device=DEVICE)
     memory = PrioritisedReplayBuffer(MEMORY_SIZE)
     
-    temperature = TEMP_START
-    tau = INITIAL_TAU
+    epsilon = EPS_START
     training_history = []
-
-    temp_step = (TEMP_START - TEMP_END) / (EPISODE_NUMBER*0.7) #Step size for linear temperature decay for most of training
+    
     
     print(f"Starting Training on {DEVICE}. Tentative Maximum Reward: {(EPISODE_LENGTH*REWARD_MODIFIER)/4}")
     for print_episode in range(1, int(EPISODE_NUMBER/EPISODE_PRINT_FREQUENCY)):
@@ -100,7 +99,7 @@ def train_agent():
             "q_mean": [],
             "throughput": 0,
             "action_counts": {},
-            "temperature": [],
+            "epsilon": [],
             "episode": 0,
             "episode_start": 0,
             "extra_timesteps": 0
@@ -109,7 +108,7 @@ def train_agent():
         for episode in range(0, EPISODE_PRINT_FREQUENCY):
 
             seed = random.randint(0, 1000000)
-            frequency = random.uniform(1.0, 3.0)
+            frequency = 1.5
             generate_routes(seed, EPISODE_LENGTH, frequency)
             #print(f"{frequency:.2f}")
 
@@ -123,14 +122,12 @@ def train_agent():
                 if current_sim_time >= EPISODE_LENGTH and len(env.active_vehicles) == 0 or current_sim_time >= EPISODE_LENGTH*3:
                     break
                 current_sim_time = traci.simulation.getTime()
-                action_idx = agent.select_action(state, current_phase, temperature)
+                action_idx = agent.select_action(state, current_phase, epsilon)
                 next_state, reward, info = env.step(action_idx)
                 next_phase = env.get_phase_vector() #Get next phase based upon this action
                 memory.push(state, action_idx, reward, next_state, current_phase, next_phase, False if done is None else True)
                 metrics = agent.train_step(memory, BATCH_SIZE, GAMMA, beta=0.6)
-                agent.update_target_network(tau) #Update the target network slightly
-
-                tau = FINAL_TAU + (INITIAL_TAU - FINAL_TAU) * (temperature / TEMP_START) #Update tau value independently of temperature (because / temp start)
+                agent.update_target_network(tau=max(FINAL_TAU, INITIAL_TAU * (epsilon ** 0.4))) #Update the target network slightly
                 
                 state = next_state
                 current_phase = next_phase
@@ -145,8 +142,8 @@ def train_agent():
                 ep_metrics["action_counts"][int(action_idx)] = ep_metrics["action_counts"].get(int(action_idx), 0) + 1
 
             ep_metrics["extra_timesteps"] += current_sim_time - EPISODE_LENGTH
-            ep_metrics["temperature"].append(temperature)
-            temperature = max(TEMP_END, temperature - temp_step)
+            ep_metrics["epsilon"].append(epsilon)
+            epsilon = max(EPS_END, epsilon * EPS_DECAY)
             agent.scheduler.step()
 
         ep_metrics["episode"] = print_episode*EPISODE_PRINT_FREQUENCY
@@ -254,7 +251,7 @@ def run_gnn_simulation(gui=False, episode_length=EPISODE_LENGTH):
                 if step_max_wait > max_wait_time_observed:
                     max_wait_time_observed = step_max_wait
 
-        arrived_vehicles += traci.simulation.getArrivedNumber()
+        arrived_vehicles += info.get("throughput", 0)
 
         current_sim_time = traci.simulation.getTime()
         if current_sim_time >= episode_length: #Terminate regardless of if empty or not
@@ -300,11 +297,10 @@ def run_baseline_simulation(gui=False, episode_length=500):
     phase_mask = create_phase_mask(NET_FILE, phases, internal_nodes).to(DEVICE)
     
     cmd_mode = SUMO_GUI_CMD if gui else SUMO_CMD
-    env = SumoIntersectionEnv(NET_FILE, cmd_mode, phases, nodes, YELLOW_TIME, 25, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
+    env = SumoIntersectionEnv(NET_FILE, cmd_mode, phases, nodes, YELLOW_TIME, DECISION_FREQUENCY, NUM_CELLS, FEATURES, CELL_LENGTH, DEVICE, REWARD_MODIFIER)
     
     print(f"Starting Heuristic Baseline (Oracle Lane Scoring). GUI: {gui}")
 
-    # Metrics
     total_reward = 0
     waiting_times = []       
     queue_lengths = []
@@ -317,63 +313,37 @@ def run_baseline_simulation(gui=False, episode_length=500):
     state = env.reset()
     done = False
     
-    # --- MAP: Signal Index -> Internal Lane ID ---
-    # We need this to know which internal lane a car is targeting
     tls_id = traci.trafficlight.getIDList()[0]
     links = traci.trafficlight.getControlledLinks(tls_id)
     signal_to_internal = {}
     for idx, connections in enumerate(links):
         if len(connections) > 0:
-            # connection = (Incoming, Outgoing, Via)
-            # We map Signal Index -> Via Lane (Internal)
             signal_to_internal[idx] = connections[0][2]
 
     while not done:
         
-        # --- 1. CALCULATE SCORES FOR INTERNAL LANES ---
-        # We need to build a score for each of the 14 internal_nodes
         internal_lane_counts = {lane: 0 for lane in internal_nodes}
-
-        # [FRESH LIST] Get IDs for Decision Making
         decision_veh_ids = traci.vehicle.getIDList()
         
         for vid in decision_veh_ids:
-            # getNextTLS returns: [(tlsID, tlsIndex, dist, state), ...]
-            next_tls = traci.vehicle.getNextTLS(vid)
+            next_tls = traci.vehicle.getNextTLS(vid) # getNextTLS returns: [(tlsID, tlsIndex, dist, state), ...]
             
             for tls_info in next_tls:
                 t_id, t_index, t_dist, _ = tls_info
-                if t_id == tls_id:
-                    # Found the target signal index. Map to Internal Lane ID.
+                if t_id == tls_id:                     # Found the target signal index. Map to Internal Lane ID.
                     if t_index in signal_to_internal:
                         target_lane = signal_to_internal[t_index]
-                        
-                        # Increment score for this internal lane
                         if target_lane in internal_lane_counts:
                             internal_lane_counts[target_lane] += 1
-                    break # Only count the immediate next light
-
-        # --- 2. CONSTRUCT SCORE TENSOR [1, 14] ---
-        # We must iterate internal_nodes to ensure the order matches phase_mask
-        ordered_scores = [internal_lane_counts[lane] for lane in internal_nodes]
+                    break
+        ordered_scores = [internal_lane_counts[lane] for lane in internal_nodes] # We must iterate internal_nodes to ensure the order matches phase_mask
         lane_score_tensor = torch.tensor([ordered_scores], dtype=torch.float32).to(DEVICE)
+        phase_scores = torch.matmul(lane_score_tensor, phase_mask.t()) # We transpose phase_mask from [848, 14] to [14, 848]
         
-        # --- 3. CALCULATE PHASE SCORES ---
-        # [1, 14] @ [14, 848] = [1, 848]
-        # We transpose phase_mask from [848, 14] to [14, 848]
-        phase_scores = torch.matmul(lane_score_tensor, phase_mask.t())
-        
-        # --- 4. SELECT ACTION ---
         action_idx = phase_scores.argmax(dim=1).item()
-        
-        # --- 5. STEP ENVIRONMENT ---
-        # This advances the simulation by 25 seconds! Old vehicle lists are now stale.
+
         next_state, reward, info = env.step(action_idx)
         total_reward += reward
-        
-        # --- 6. COLLECT METRICS ---
-        # [FIX] Refresh the list of vehicles immediately after the step
-        # This prevents "Vehicle not known" errors for cars that left during the step
         current_veh_ids = traci.vehicle.getIDList()
         
         if len(current_veh_ids) > 0:
@@ -393,14 +363,13 @@ def run_baseline_simulation(gui=False, episode_length=500):
                 if step_max > max_wait_time_observed:
                     max_wait_time_observed = step_max
 
-        arrived_vehicles += traci.simulation.getArrivedNumber()
+        arrived_vehicles += info.get("throughput", 0)
         
         if traci.simulation.getTime() >= episode_length:
             done = True
             
     traci.close()
     
-    # Final Metrics Calculation
     avg_wait = np.mean(list(track_waits.values())) if track_waits else 0.0
     avg_speed = (np.mean(speeds) * 3.6) if speeds else 0.0 
     avg_queue = np.mean(queue_lengths) if queue_lengths else 0.0
@@ -439,7 +408,7 @@ def compare_agents():
     generate_routes(seed, EPISODE_LENGTH, frequency)
 
     gnn_metrics = run_gnn_simulation(gui=False, episode_length=EPISODE_LENGTH)
-    base_metrics = run_baseline_simulation(gui=True, episode_length=EPISODE_LENGTH)
+    base_metrics = run_baseline_simulation(gui=False, episode_length=EPISODE_LENGTH)
 
     headers = ["Metric", "Baseline", "TrafficGNN", "Diff"]
     table_data = []
@@ -465,4 +434,4 @@ if __name__ == "__main__":
     history = train_agent()
     plot_training_results(history)
     watch_agent()
-    #compare_agents()
+    compare_agents()
