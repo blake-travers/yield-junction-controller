@@ -431,7 +431,7 @@ def compare_agents():
     print(tabulate(table_data, headers=headers, tablefmt="grid")) #Print table in nice format
 
 if __name__ == "__main__":
-    history = train_agent()
-    plot_training_results(history)
+    #history = train_agent()
+    #plot_training_results(history)
     watch_agent()
-    compare_agents()
+    #compare_agents()
